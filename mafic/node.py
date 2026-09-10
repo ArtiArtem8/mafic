@@ -40,7 +40,7 @@ from .warnings import *
 
 if TYPE_CHECKING:
     from asyncio import Task
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
     from typing import Any, Literal
 
     from aiohttp import ClientWebSocketResponse
@@ -53,6 +53,7 @@ if TYPE_CHECKING:
         Coro,
         EventPayload,
         IncomingMessage,
+        JSONValue,
         OutgoingMessage,
         OutgoingParams,
         Player as PlayerPayload,
@@ -61,6 +62,7 @@ if TYPE_CHECKING:
         TrackLoadingResult,
         UpdatePlayerParams,
         UpdatePlayerPayload,
+        UpdatePlayerTrack,
         UpdateSessionPayload,
     )
 
@@ -998,11 +1000,12 @@ class Node(Generic[ClientT]):
         guild_id: int,
         track: Track | str | None = MISSING,
         position: int | None = None,
-        end_time: int | None = None,
+        end_time: int | None = MISSING,
         volume: int | None = None,
         no_replace: bool | None = None,
         pause: bool | None = None,
         filter: Filter | None = None,
+        user_data: Mapping[str, JSONValue] = MISSING,
     ) -> Coro[PlayerPayload]:
         """Update a player.
 
@@ -1029,19 +1032,56 @@ class Node(Generic[ClientT]):
             Whether to pause the player.
         filter:
             The filter to apply to the player.
+        user_data:
+            JSON-compatible data to associate with the track. When omitted for a
+            :class:`Track`, its existing :attr:`Track.user_data` is preserved.
+
+            This is only supported by Lavalink v4.
         """
         data: UpdatePlayerPayload = {}
 
-        if track is not MISSING:
-            if isinstance(track, Track) or track is None:
-                data["encodedTrack"] = track.id if track is not None else None
+        if user_data is not MISSING and track is MISSING:
+            msg = "user_data cannot be updated without specifying a track."
+            raise ValueError(msg)
+
+        if self._version == 3:
+            if user_data is not MISSING:
+                msg = "Lavalink version 3 does not support track user data."
+                raise TypeError(msg)
+
+            if isinstance(track, Track) and track.user_data:
+                msg = "Lavalink version 3 cannot preserve Track.user_data."
+                raise TypeError(msg)
+
+            if track is not MISSING:
+                if isinstance(track, Track) or track is None:
+                    data["encodedTrack"] = track.id if track is not None else None
+                else:
+                    data["identifier"] = track
+        elif track is not MISSING:
+            track_data: UpdatePlayerTrack = {}
+
+            if isinstance(track, Track):
+                track_data["encoded"] = track.id
+                resolved_user_data = (
+                    track.user_data if user_data is MISSING else user_data
+                )
+                track_data["userData"] = dict(resolved_user_data)
+            elif track is None:
+                track_data["encoded"] = None
+                if user_data is not MISSING:
+                    track_data["userData"] = dict(user_data)
             else:
-                data["identifier"] = track
+                track_data["identifier"] = track
+                if user_data is not MISSING:
+                    track_data["userData"] = dict(user_data)
+
+            data["track"] = track_data
 
         if position is not None:
             data["position"] = position
 
-        if end_time is not None:
+        if end_time is not MISSING:
             data["endTime"] = end_time
 
         if volume is not None:

@@ -30,6 +30,8 @@ from .type_variables import ClientT
 from .typings import TrackWithInfo
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from .__libraries import (
         Connectable,
         Guild,
@@ -38,7 +40,12 @@ if TYPE_CHECKING:
     )
     from .node import Node
     from .playlist import Playlist
-    from .typings import EventPayload, Player as PlayerPayload, PlayerUpdateState
+    from .typings import (
+        EventPayload,
+        JSONValue,
+        Player as PlayerPayload,
+        PlayerUpdateState,
+    )
 
 
 _log = getLogger(__name__)
@@ -608,11 +615,12 @@ class Player(VoiceProtocol, Generic[ClientT]):
         *,
         track: Track | str | None = MISSING,
         position: int | None = None,
-        end_time: int | None = None,
+        end_time: int | None = MISSING,
         volume: int | None = None,
         pause: bool | None = None,
         filter: Filter | None = None,
         replace: bool = False,
+        user_data: Mapping[str, JSONValue] = MISSING,
     ) -> None:
         """Update the player.
 
@@ -626,7 +634,8 @@ class Player(VoiceProtocol, Generic[ClientT]):
         position:
             The position to start the track at.
         end_time:
-            The time to end the track at.
+            The time to end the track at. Pass ``None`` explicitly to reset a
+            previously configured end time. Omitting it leaves the end time unchanged.
         volume:
             The volume to play the track at.
         pause:
@@ -635,6 +644,11 @@ class Player(VoiceProtocol, Generic[ClientT]):
             The filter to apply to the track.
         replace:
             Whether to replace the current track if one is playing.
+        user_data:
+            JSON-compatible data to associate with the track. When omitted for a
+            :class:`Track`, its existing :attr:`Track.user_data` is preserved.
+
+            This is only supported by Lavalink v4.
 
         Raises
         ------
@@ -646,6 +660,15 @@ class Player(VoiceProtocol, Generic[ClientT]):
 
         # v4+ receives the full payload in events, so there is no need to
         # pre-emptyively update the player.
+        if self.node.version == 3:
+            if user_data is not MISSING:
+                message = "Lavalink version 3 does not support track user data."
+                raise TypeError(message)
+
+            if isinstance(track, Track) and track.user_data:
+                message = "Lavalink version 3 cannot preserve Track.user_data."
+                raise TypeError(message)
+
         if track is not None and self.node.version == 3:
             if isinstance(track, str):
                 message = (
@@ -665,6 +688,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
             pause=pause,
             filter=filter,
             no_replace=not replace,
+            user_data=user_data,
         )
 
         if data["track"]:
@@ -679,10 +703,11 @@ class Player(VoiceProtocol, Generic[ClientT]):
         /,
         *,
         start_time: int | None = None,
-        end_time: int | None = None,
+        end_time: int | None = MISSING,
         volume: int | None = None,
         replace: bool = True,
         pause: bool | None = None,
+        user_data: Mapping[str, JSONValue] = MISSING,
     ) -> None:
         """Play the given track.
 
@@ -696,13 +721,19 @@ class Player(VoiceProtocol, Generic[ClientT]):
         start_time:
             The position to start the track at.
         end_time:
-            The time to end the track at.
+            The time to end the track at. Pass ``None`` explicitly to reset a
+            previously configured end time.
         volume:
             The volume to play the track at.
         replace:
             Whether to replace the current track if one is playing.
         pause:
             Whether to pause the track.
+        user_data:
+            JSON-compatible data to associate with the track. When omitted, the
+            :attr:`Track.user_data` from a :class:`Track` is used.
+
+            This is only supported by Lavalink v4.
 
         Raises
         ------
@@ -720,6 +751,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
             volume=volume,
             replace=replace,
             pause=pause,
+            user_data=user_data,
         )
 
     async def pause(self, pause: bool = True) -> None:  # noqa: FBT001, FBT002
