@@ -35,16 +35,6 @@ if TYPE_CHECKING:
     )
 
 
-def merge_in_place(left: Filter, right: Filter, *, use_or: bool) -> Filter:
-    """Apply an in-place filter merge and return the mutated filter."""
-    if use_or:
-        left.__ior__(right)
-    else:
-        left.__iand__(right)
-
-    return left
-
-
 class PlayerStateTests(TestCase):
     """Verify player reconstruction from the stable REST object."""
 
@@ -88,20 +78,25 @@ class FilterProtocolTests(TestCase):
 
     def test_zero_volume_survives_every_merge_operator(self) -> None:
         """Zero is a valid volume, so a merge must not treat it as unset."""
-        zero = Filter(volume=0.0)
-        other = Filter(volume=1.0)
-
-        cases: list[tuple[str, Filter]] = [
-            ("or", other | zero),
-            ("and", zero & other),
-            ("ior", merge_in_place(other, zero, use_or=True)),
-            ("iand", merge_in_place(zero, other, use_or=False)),
+        cases: list[tuple[str, Filter | None]] = [
+            ("or", Filter(volume=1.0) | Filter(volume=0.0)),
+            ("and", Filter(volume=0.0) & Filter(volume=1.0)),
         ]
 
-        for name, merged in cases:
+        ior_left, ior_right = Filter(volume=1.0), Filter(volume=0.0)
+        ior_left |= ior_right
+        cases.append(("ior", ior_left))
+
+        iand_left, iand_right = Filter(volume=0.0), Filter(volume=1.0)
+        iand_left &= iand_right
+        cases.append(("iand", iand_left))
+
+        for name, result in cases:
             with self.subTest(operator=name):
-                self.assertEqual(merged.volume, 0.0)
-                self.assertEqual(merged.payload, {"volume": 0.0})
+                if result is None:
+                    self.fail(f"{name} did not return a filter.")
+                self.assertEqual(result.volume, 0.0)
+                self.assertEqual(result.payload, {"volume": 0.0})
 
 
 class MiscProtocolTests(TestCase):
