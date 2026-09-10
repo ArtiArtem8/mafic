@@ -353,6 +353,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
             The voice state update payload.
         """
         before_session_id = self._session_id
+        before_channel_id = self.channel.id
         self._session_id = data["session_id"]
 
         channel_id = data["channel_id"]
@@ -370,7 +371,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
 
         self.channel = channel
 
-        if self._session_id != before_session_id:
+        if self._session_id != before_session_id or channel.id != before_channel_id:
             await self._dispatch_player_update()
 
         self._voice_state_update_event.set()

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import warnings
+from asyncio import Event
 from collections import OrderedDict
 from time import time
 from types import SimpleNamespace
@@ -175,6 +176,40 @@ class NodeProtocolTests(IsolatedAsyncioTestCase):
         self.assertFalse(
             any(isinstance(item.message, UnsupportedVersionWarning) for item in caught)
         )
+
+
+class VoiceStateTests(IsolatedAsyncioTestCase):
+    """Verify Discord voice state changes reach Lavalink."""
+
+    async def test_channel_move_dispatches_update_with_unchanged_session(self) -> None:
+        """A voice channel move updates DAVE's required channel ID."""
+
+        class FakeVoiceChannel:
+            def __init__(self, channel_id: int) -> None:
+                self.id = channel_id
+
+        player: Player[Client] = object.__new__(Player)
+        player._session_id = "discord-session"
+        player.channel = cast("object", FakeVoiceChannel(10))
+        player.guild = cast(
+            "object", SimpleNamespace(get_channel=lambda _: FakeVoiceChannel(20))
+        )
+        player._voice_state_update_event = Event()
+        dispatch = AsyncMock()
+
+        with (
+            patch("mafic.player.VoiceChannel", FakeVoiceChannel),
+            patch.object(Player, "_dispatch_player_update", dispatch),
+        ):
+            await player.on_voice_state_update(
+                cast(
+                    "object",
+                    {"session_id": "discord-session", "channel_id": "20"},
+                )
+            )
+
+        dispatch.assert_awaited_once_with()
+        self.assertEqual(player.channel.id, 20)
 
 
 class TransferMetadataTests(IsolatedAsyncioTestCase):
