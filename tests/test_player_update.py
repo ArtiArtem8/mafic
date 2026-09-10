@@ -222,3 +222,34 @@ class PlayerPlayTests(IsolatedAsyncioTestCase):
                 }
             },
         )
+        self.assertIsNotNone(player.current)
+        if player.current is None:
+            self.fail("Player did not keep the Track returned by Lavalink.")
+        self.assertEqual(player.current.user_data["correlation_id"], "explicit")
+
+    async def test_play_can_clear_track_user_data(self) -> None:
+        """An explicit empty object replaces a Track's existing metadata."""
+        node = make_node(4)
+        player: Player[Client] = object.__new__(Player)
+        player._node = node
+        player._connected = True
+        player._guild_id = 1
+        response = player_payload()
+        if response["track"] is None:
+            self.fail("The test player response did not contain a track.")
+        response["track"]["userData"] = {}
+        request = AsyncMock(return_value=response)
+
+        with patch.object(Node, "_Node__request", request):
+            await player.play(Track.from_data_with_info(track_payload()), user_data={})
+
+        if request.await_args is None:
+            self.fail("Player did not make an update request.")
+        self.assertEqual(
+            request.await_args.args[2],
+            {"track": {"encoded": "encoded-track", "userData": {}}},
+        )
+        self.assertIsNotNone(player.current)
+        if player.current is None:
+            self.fail("Player did not keep the Track returned by Lavalink.")
+        self.assertEqual(player.current.user_data, {})
