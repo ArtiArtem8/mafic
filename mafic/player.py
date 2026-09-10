@@ -297,7 +297,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
             self.client.dispatch("track_end", event)
             _log.debug("Received track end event: %s", event)
 
-            if data["reason"] != "REPLACED":
+            if data["reason"] not in ("REPLACED", "replaced"):
                 self._current = None
         elif data["type"] == "TrackExceptionEvent":
             track = (

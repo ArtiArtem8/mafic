@@ -67,24 +67,32 @@ class TrackLoadException(PlayerException):
 
     Attributes
     ----------
-    message: :class:`str`
+    message: :data:`~typing.Optional`\[:class:`str`]
         The message returned by the node.
-    severity: :data:`~typing.Literal`\[``"COMMON"``, ``"SUSPICIOUS"``, ``"FATAL"``]
+    severity: :data:`~typing.Literal`\[``"COMMON"``, ``"SUSPICIOUS"``, ``"FAULT"``]
         The severity of the error.
 
         This is lowercase in Lavalink v4.
     cause: :class:`str`
         The cause of the error.
+    cause_stack_trace: :class:`str`
+        The full stack trace of the cause, when supplied by Lavalink.
     """
 
     def __init__(
-        self, *, message: str, severity: ExceptionSeverity, cause: str
+        self,
+        *,
+        message: str | None,
+        severity: ExceptionSeverity,
+        cause: str,
+        cause_stack_trace: str = "",
     ) -> None:
         super().__init__(f"The track could not be loaded: {message} ({severity} error)")
 
-        self.message: str = message
+        self.message: str | None = message
         self.severity: ExceptionSeverity = severity
         self.cause: str = cause
+        self.cause_stack_trace: str = cause_stack_trace
 
     @classmethod
     def from_data(cls, data: LavalinkException) -> Self:
@@ -101,7 +109,10 @@ class TrackLoadException(PlayerException):
             The constructed exception.
         """
         return cls(
-            message=data["message"], severity=data["severity"], cause=data["cause"]
+            message=data["message"],
+            severity=data["severity"],
+            cause=data["cause"],
+            cause_stack_trace=data.get("causeStackTrace", ""),
         )
 
 

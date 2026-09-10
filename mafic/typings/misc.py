@@ -2,7 +2,20 @@
 
 from __future__ import annotations
 
-from typing import Any, Coroutine, Dict, List, Literal, TypedDict, TypeVar, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Coroutine,
+    Dict,
+    List,
+    Literal,
+    TypedDict,
+    TypeVar,
+    Union,
+)
+
+if TYPE_CHECKING:
+    from typing_extensions import NotRequired
 
 __all__ = (
     "Coro",
@@ -33,8 +46,10 @@ ExceptionSeverity = Literal[
 
 class LavalinkException(TypedDict):
     severity: ExceptionSeverity
-    message: str
+    message: str | None
     cause: str
+    # Lavalink v3 does not include this field.
+    causeStackTrace: NotRequired[str]
 
 
 class PayloadWithGuild(TypedDict):
