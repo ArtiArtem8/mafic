@@ -4,7 +4,10 @@
 > This is a maintained fork of [ooliver1/mafic](https://github.com/ooliver1/mafic),
 > focused on compatibility with current Lavalink v4 releases.
 >
-> The fork currently targets Lavalink 4.2.2, with complete v4 track metadata
+> Supports Python 3.12–3.14 and is maintained against current stable
+> discord.py, nextcord, disnake and py-cord (with its `voice` extra).
+>
+> Targets Lavalink 4.2.2, with complete v4 track metadata
 > (`pluginInfo` / `userData`) round-tripping, the current Update Player track
 > payload, and related protocol correctness fixes.
 >

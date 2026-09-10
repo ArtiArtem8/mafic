@@ -30,20 +30,87 @@ Here is some helpful information and guidelines to contribute:
 
 ### Installing Dependencies Locally
 
-Mafic uses [Poetry](https://python-poetry.org/) for dependency management. You may either install it globally, with `pipx`, or use a virtual environment. If you are using a virtual environment, you will need to install Poetry in that environment.
+The maintained fork supports Python 3.12–3.14 and targets Lavalink 4.2.2.
+Use [Poetry 2.4.3](https://python-poetry.org/) and the committed `poetry.lock`:
 
-To install globally: <https://python-poetry.org/docs/#installing-with-the-official-installer>
-To install in a virtual environment: <https://python-poetry.org/docs/#installing-manually>
+```sh
+pipx install poetry==2.4.3
+poetry env use 3.12
+poetry sync --extras speedups
+poetry run python -m unittest discover -s tests -t .
+```
 
-To install the dependencies, run `poetry install` in the root directory of the project.
+The default `lint` group installs current Nextcord. To test another Discord
+library, create a fresh virtual environment and select exactly one group with
+`poetry sync --only main,dev,<group> --extras speedups`:
 
-### Code Style
+| Group | Library |
+| --- | --- |
+| `lint` | nextcord |
+| `disnake` | disnake |
+| `discordpy` | discord.py |
+| `pycord` | py-cord with its required `voice` extra |
 
-We use [Black](https://github.com/psf/black) for code formatting, [Isort](https://github.com/pycqa/isort) for import sorting, [Flake8](https://github.com/PyCQA/flake8) for code style linting, [Slotscheck](https://github.com/ariebovenberg/slotscheck) and several other [pre-commit hooks](https://github.com/pre-commit/pre-commit-hooks) for linting.
+Pycord 2.8 requires `py-cord[voice]` to import `VoiceProtocol`; the group includes
+this extra even though the tests need no Discord token.
 
-To use all of these at once, after [installing](#installing-dependencies-locally), you can simply run `task lint` in the root directory of the project, or `python -m task lint` (`py -m` etc) if that does not work.
+Do not install discord.py and py-cord in the same environment: both own the
+`discord` package. Compatibility tests use separate environments and do not set
+`MAFIC_IGNORE_LIBRARY_CHECK`. CI runs import, all unit tests and slotscheck for
+all four libraries on each supported Python version.
 
-If you want `pre-commit` to run automatically whenever you commit, you can use `task pre-commit`.
+The optional `docs` group retains the existing Sphinx toolchain. Use
+`poetry sync --with docs --extras speedups` on Python 3.12 for documentation work.
+
+### Code Style and Type Checking
+
+Black remains the formatter. Ruff checks code without imposing a migration to
+PEP 695 generics, StrEnum, or sorted exports/slots. Only formatting required by
+the pinned Black version is applied. Tool versions and hook revisions must be
+updated together; regenerate and commit the lock with `poetry lock`.
+
+```sh
+poetry run task lint
+poetry run pre-commit run --all-files
+poetry run black --check .
+poetry run ruff check .
+poetry run python -m slotscheck -m mafic
+```
+
+Both lint commands run the same hooks. Pre-commit creates its own environment
+with the pinned Nextcord dependencies for slotscheck. To install Git hooks, run
+`poetry run task pre-commit`.
+
+For static analysis, the library adapter needs all three import namespaces:
+
+```sh
+poetry sync --only main,dev,lint,disnake,discordpy --extras speedups
+poetry run task pyright
+```
+
+This environment is for type checking; use an isolated library environment for
+runtime tests. The `discord` namespace is supplied by discord.py here. Pycord's
+runtime compatibility is tested separately. CI checks types for Python 3.12,
+3.13 and 3.14 on Linux. A duplicate Windows type-check pass adds no coverage of
+Mafic platform branches, since there are none; local Windows runtime tests still
+exercise the event loop and imports.
+
+### Lavalink Integration
+
+CI has one separate job using Java 21 and the exact Lavalink 4.2.2 release.
+It needs no Discord token and verifies REST track metadata round-tripping,
+player updates and stopping. It does not test Discord voice transport.
+
+To run locally, start Lavalink 4.2.2 with its YouTube source enabled (the fixture
+is a pre-encoded YouTube track). Set `LAVALINK_INTEGRATION_URL` and
+`LAVALINK_INTEGRATION_PASSWORD`, then run in an isolated library environment:
+
+```sh
+poetry run python -m unittest tests.integration_lavalink -v
+```
+
+Without these variables the integration test is explicitly skipped. Ordinary
+unit-test discovery never downloads or starts Lavalink.
 
 ### Type Annotations
 
