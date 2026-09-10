@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Literal, TypedDict
 
-from .misc import JSONObject, JSONValue, PayloadWithGuild
+from .misc import JSONObject, PayloadWithGuild
 
 if TYPE_CHECKING:
     from typing_extensions import NotRequired
@@ -100,7 +100,7 @@ class Filters(TypedDict, total=False):
     distortion: Distortion
     channelMix: ChannelMix
     lowPass: LowPass
-    pluginFilters: dict[str, JSONValue]
+    pluginFilters: dict[str, JSONObject]
 
 
 class PlayerState(TypedDict):
