@@ -814,7 +814,6 @@ class Filter:
             distortion=other.distortion or self.distortion,
             channel_mix=other.channel_mix or self.channel_mix,
             low_pass=other.low_pass or self.low_pass,
-            # 0.0 is a valid volume, so it cannot be merged with `or`.
             volume=other.volume if other.volume is not None else self.volume,
             plugin_filters=other.plugin_filters or self.plugin_filters,
         )
@@ -836,7 +835,6 @@ class Filter:
         self.distortion = other.distortion or self.distortion
         self.channel_mix = other.channel_mix or self.channel_mix
         self.low_pass = other.low_pass or self.low_pass
-        # 0.0 is a valid volume, so it cannot be merged with `or`.
         self.volume = other.volume if other.volume is not None else self.volume
         self.plugin_filters = other.plugin_filters or self.plugin_filters
 
@@ -860,7 +858,6 @@ class Filter:
             distortion=self.distortion or other.distortion,
             channel_mix=self.channel_mix or other.channel_mix,
             low_pass=self.low_pass or other.low_pass,
-            # 0.0 is a valid volume, so it cannot be merged with `or`.
             volume=self.volume if self.volume is not None else other.volume,
             plugin_filters=self.plugin_filters or other.plugin_filters,
         )
@@ -882,7 +879,6 @@ class Filter:
         self.distortion = self.distortion or other.distortion
         self.channel_mix = self.channel_mix or other.channel_mix
         self.low_pass = self.low_pass or other.low_pass
-        # 0.0 is a valid volume, so it cannot be merged with `or`.
         self.volume = self.volume if self.volume is not None else other.volume
         self.plugin_filters = self.plugin_filters or other.plugin_filters
 

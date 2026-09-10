@@ -43,8 +43,7 @@ class MaficLavalinkIntegrationTests(IsolatedAsyncioTestCase):
         node: Node[object] = object.__new__(Node)
         node._version = 4
         node._label = "integration"
-        node._base_uri = URL(INTEGRATION_URL)
-        node._rest_uri = node._base_uri / "v4"
+        node._rest_uri = URL(INTEGRATION_URL) / "v4"
         node._session_id = None
         node._ws = None
         node._ws_task = None
@@ -74,10 +73,12 @@ class MaficLavalinkIntegrationTests(IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self) -> None:
         """Destroy the test player and release the session."""
-        await self.node.destroy(GUILD_ID)
-        await self.node.close()
-        await self.websocket.close()
-        await self.session.close()
+        try:
+            await self.node.destroy(GUILD_ID)
+        finally:
+            await self.node.close()
+            await self.websocket.close()
+            await self.session.close()
 
     async def test_track_user_data_round_trip(self) -> None:
         """Mafic sends and parses canonical v4 track metadata."""

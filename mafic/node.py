@@ -178,7 +178,6 @@ class Node(Generic[ClientT]):
         "__password",
         "__session",
         "_available",
-        "_base_uri",
         "_checked_version",
         "_client",
         "_connect_task",
@@ -237,8 +236,6 @@ class Node(Generic[ClientT]):
         self._rest_uri = yarl.URL.build(
             scheme=f"http{'s'*secure}", host=host, port=port
         )
-        # `_rest_uri` gains the `/v3` or `/v4` prefix once the version is known.
-        self._base_uri = self._rest_uri
         self._ws_uri = yarl.URL.build(scheme=f"ws{'s'*secure}", host=host, port=port)
         self._resume_key = resume_key or f"{host}:{port}:{label}"
         self._resuming_session_id: str = resuming_session_id or ""
@@ -1122,7 +1119,7 @@ class Node(Generic[ClientT]):
     async def __request(
         self,
         method: str,
-        path: str | yarl.URL,
+        path: str,
         json: OutgoingMessage | None = None,
         params: OutgoingParams | None = None,
     ) -> Any:  # noqa: ANN401
@@ -1133,8 +1130,7 @@ class Node(Generic[ClientT]):
         method:
             The HTTP method to use.
         path:
-            The path to send the request to, without ``/v3``, or a complete URL to
-            send the request to instead.
+            The path to send the request to, without ``/v3``
         json:
             The JSON to send.
         params:
@@ -1149,7 +1145,7 @@ class Node(Generic[ClientT]):
             self.__session = await self._create_session()
 
         session = self.__session
-        uri = path if isinstance(path, yarl.URL) else self._rest_uri / path
+        uri = self._rest_uri / path
 
         _log.debug(
             "Sending %s request to %s and data %s.",
@@ -1301,9 +1297,7 @@ class Node(Generic[ClientT]):
         """
         if self._version == 3:
             # Lavalink v3 keeps this route unprefixed.
-            plugins: list[PluginData] = await self.__request(
-                "GET", self._base_uri / "plugins"
-            )
+            plugins: list[PluginData] = await self.__request("GET", "../plugins")
         else:
             info: Info = await self.__request("GET", "info")
             plugins = info["plugins"]

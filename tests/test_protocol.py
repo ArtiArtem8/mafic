@@ -175,8 +175,7 @@ class NodeProtocolTests(IsolatedAsyncioTestCase):
     async def test_v3_fetch_plugins_uses_unprefixed_route(self) -> None:
         """Lavalink v3 exposes plugins at /plugins, not /v3/plugins."""
         node = make_node(3)
-        node._base_uri = URL("http://localhost:2333")
-        node._rest_uri = node._base_uri / "v3"
+        node._rest_uri = URL("http://localhost:2333/v3")
         request = AsyncMock(return_value=[{"name": "test", "version": "1"}])
 
         with patch.object(Node, "_Node__request", request):
@@ -185,7 +184,7 @@ class NodeProtocolTests(IsolatedAsyncioTestCase):
         self.assertEqual(
             [(plugin.name, plugin.version) for plugin in plugins], [("test", "1")]
         )
-        request.assert_awaited_once_with("GET", URL("http://localhost:2333/plugins"))
+        request.assert_awaited_once_with("GET", "../plugins")
 
     async def test_disabled_routeplanner_returns_none(self) -> None:
         """A 204 routeplanner response maps to None."""
