@@ -664,8 +664,6 @@ class Player(VoiceProtocol, Generic[ClientT]):
         if self._node is None or not self._connected:
             raise PlayerNotConnected
 
-        # v4+ receives the full payload in events, so there is no need to
-        # pre-emptyively update the player.
         if self.node.version == 3:
             if user_data is not MISSING:
                 message = "Lavalink version 3 does not support track user data."
@@ -675,6 +673,8 @@ class Player(VoiceProtocol, Generic[ClientT]):
                 message = "Lavalink version 3 cannot preserve Track.user_data."
                 raise TypeError(message)
 
+        # v4+ receives the full payload in events, so there is no need to
+        # pre-emptyively update the player.
         if track is not None and self.node.version == 3:
             if isinstance(track, str):
                 message = (

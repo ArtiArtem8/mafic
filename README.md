@@ -1,5 +1,16 @@
 # Mafic
 
+> [!NOTE]
+> This is a maintained fork of [ooliver1/mafic](https://github.com/ooliver1/mafic),
+> focused on compatibility with current Lavalink v4 releases.
+>
+> The fork currently targets Lavalink 4.2.2, with complete v4 track metadata
+> (`pluginInfo` / `userData`) round-tripping, the current Update Player track
+> payload, and related protocol correctness fixes.
+>
+> Upstream changes are kept separate so fixes can still be contributed back
+> as focused pull requests.
+
 [![MIT License](https://custom-icon-badges.demolab.com/github/license/ooliver1/mafic?color=845ec2&logo=code-square)](https://github.com/ooliver1/mafic/blob/master/LICENSE "License File")
 [![Releases](https://custom-icon-badges.demolab.com/github/v/release/ooliver1/mafic?display_name=tag&include_prereleases&sort=semver&logo=commit&color=c25db8)](https://github.com/ooliver1/mafic/releases "Mafic Releases")
 [![Discord](https://img.shields.io/discord/864563184919773226?color=f062a4&logo=discord&logoColor=white)](https://discord.gg/mMvUABNegY "Discord Server")
@@ -93,3 +104,7 @@ async def play(inter: nextcord.Interaction, query: str):
 
 bot.run(...)
 ```
+
+## Acknowledgements
+
+- Used generative AI.
