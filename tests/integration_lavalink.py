@@ -1,11 +1,15 @@
-"""Opt-in smoke test against a real Lavalink 4.2.2 process."""
+"""Opt-in smoke test against a real Lavalink 4.2.2 process.
+
+This drives Mafic's own REST serialization and Track parsing. It does not cover
+Mafic's websocket or voice handling, which needs a Discord client.
+"""
 
 from __future__ import annotations
 
 from os import getenv
 from unittest import IsolatedAsyncioTestCase, skipUnless
 
-from aiohttp import ClientSession
+from yarl import URL
 
 INTEGRATION_URL = getenv("LAVALINK_INTEGRATION_URL")
 INTEGRATION_PASSWORD = getenv("LAVALINK_INTEGRATION_PASSWORD")
@@ -15,78 +19,94 @@ ENCODED_TRACK = (
     "Oi8vd3d3LnlvdXR1YmUuY29tL3dhdGNoP3Y9ZFF3NHc5V2dYY1EAB3lvdXR1"
     "YmUAAAAAAAAAAA=="
 )
+GUILD_ID = 123456789
 
 
 @skipUnless(
     INTEGRATION_URL and INTEGRATION_PASSWORD,
     "set LAVALINK_INTEGRATION_URL and LAVALINK_INTEGRATION_PASSWORD",
 )
-class LavalinkIntegrationTests(IsolatedAsyncioTestCase):
-    """Exercise the stable Lavalink 4.2.2 REST and websocket contracts."""
+class MaficLavalinkIntegrationTests(IsolatedAsyncioTestCase):
+    """Exercise Mafic against a real Lavalink 4 node."""
 
-    async def test_track_user_data_round_trip(self) -> None:
-        """Update/get/stop a player with canonical nested track metadata."""
+    async def asyncSetUp(self) -> None:
+        """Build a Node that talks to the real node without a Discord client."""
+        # Mafic refuses to import when several Discord libraries are installed,
+        # so `MAFIC_IGNORE_LIBRARY_CHECK=1` may be needed to collect this module.
+        from asyncio import Event
+
+        from mafic.node import Node
+
         if INTEGRATION_URL is None or INTEGRATION_PASSWORD is None:
             self.fail("Integration environment was not configured.")
 
-        headers = {
-            "Authorization": INTEGRATION_PASSWORD,
-            "User-Id": "123456789",
-            "Client-Name": "Mafic/integration",
-        }
-        # Parenthesized multi-context syntax is unavailable on Python 3.8.
-        async with ClientSession(headers=headers) as session:  # noqa: SIM117
-            async with session.ws_connect(
-                f"{INTEGRATION_URL}/v4/websocket"
-            ) as websocket:
-                ready = await websocket.receive_json(timeout=10)
-                self.assertEqual(ready["op"], "ready")
-                session_id = ready["sessionId"]
+        node: Node[object] = object.__new__(Node)
+        node._version = 4
+        node._label = "integration"
+        node._base_uri = URL(INTEGRATION_URL)
+        node._rest_uri = node._base_uri / "v4"
+        node._session_id = None
+        node._ws = None
+        node._ws_task = None
+        node._connect_task = None
+        node._ready = Event()
+        node._event_queue = Event()
+        object.__setattr__(node, "_Node__password", INTEGRATION_PASSWORD)
+        object.__setattr__(node, "_Node__session", None)
+        self.node = node
 
-                async with session.get(f"{INTEGRATION_URL}/version") as response:
-                    self.assertEqual(response.status, 200)
-                    self.assertEqual(await response.text(), "4.2.2")
+        # A websocket connection creates the session that owns the player.
+        from aiohttp import ClientSession
 
-                async with session.get(
-                    f"{INTEGRATION_URL}/v4/decodetrack",
-                    params={"encodedTrack": ENCODED_TRACK},
-                ) as response:
-                    self.assertEqual(response.status, 200)
-                    decoded = await response.json()
-                    self.assertIn("pluginInfo", decoded)
-                    self.assertIn("userData", decoded)
+        self.session = ClientSession(
+            headers={
+                "Authorization": INTEGRATION_PASSWORD,
+                "User-Id": str(GUILD_ID),
+                "Client-Name": "Mafic/integration",
+            }
+        )
+        self.websocket = await self.session.ws_connect(
+            f"{INTEGRATION_URL}/v4/websocket"
+        )
+        ready = await self.websocket.receive_json(timeout=10)
+        self.assertEqual(ready["op"], "ready")
+        self.node._session_id = ready["sessionId"]
 
-                player_url = (
-                    f"{INTEGRATION_URL}/v4/sessions/{session_id}/players/123456789"
-                )
-                update = {
-                    "track": {
-                        "encoded": ENCODED_TRACK,
-                        "userData": {"correlation_id": "integration"},
-                    }
-                }
-                async with session.patch(player_url, json=update) as response:
-                    self.assertEqual(response.status, 200)
-                    player = await response.json()
-                    self.assertEqual(
-                        player["track"]["userData"]["correlation_id"],
-                        "integration",
-                    )
+    async def asyncTearDown(self) -> None:
+        """Destroy the test player and release the session."""
+        await self.node.destroy(GUILD_ID)
+        await self.node.close()
+        await self.websocket.close()
+        await self.session.close()
 
-                async with session.get(player_url) as response:
-                    self.assertEqual(response.status, 200)
-                    player = await response.json()
-                    self.assertEqual(
-                        player["track"]["userData"]["correlation_id"],
-                        "integration",
-                    )
+    async def test_track_user_data_round_trip(self) -> None:
+        """Mafic sends and parses canonical v4 track metadata."""
+        async with self.session.get(f"{INTEGRATION_URL}/version") as response:
+            self.assertEqual(response.status, 200)
+            self.assertTrue((await response.text()).startswith("4.2."))
 
-                async with session.patch(
-                    player_url, json={"track": {"encoded": None}}
-                ) as response:
-                    self.assertEqual(response.status, 200)
-                    player = await response.json()
-                    self.assertIsNone(player["track"])
+        # Decoding goes through Mafic's Track parsing.
+        decoded = await self.node.decode_track(ENCODED_TRACK)
+        self.assertIsInstance(decoded.plugin_info, dict)
+        self.assertIsInstance(decoded.user_data, dict)
 
-                async with session.delete(player_url) as response:
-                    self.assertEqual(response.status, 204)
+        player = await self.node.update(
+            guild_id=GUILD_ID,
+            track=decoded,
+            user_data={"correlation_id": "integration"},
+        )
+
+        track = player["track"]
+        if track is None:
+            self.fail("Lavalink did not accept the updated track.")
+        self.assertEqual(track["userData"]["correlation_id"], "integration")
+
+        # A subsequent read goes through the same parsing path.
+        fetched = await self.node.fetch_player(GUILD_ID)
+        track = fetched["track"]
+        if track is None:
+            self.fail("Lavalink did not report the updated track.")
+        self.assertEqual(track["userData"]["correlation_id"], "integration")
+
+        stopped = await self.node.update(guild_id=GUILD_ID, track=None)
+        self.assertIsNone(stopped["track"])
