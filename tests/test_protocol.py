@@ -35,6 +35,16 @@ if TYPE_CHECKING:
     )
 
 
+def merge_in_place(left: Filter, right: Filter, *, use_or: bool) -> Filter:
+    """Apply an in-place filter merge and return the mutated filter."""
+    if use_or:
+        left.__ior__(right)
+    else:
+        left.__iand__(right)
+
+    return left
+
+
 class PlayerStateTests(TestCase):
     """Verify player reconstruction from the stable REST object."""
 
@@ -166,6 +176,21 @@ class NodeProtocolTests(IsolatedAsyncioTestCase):
             [(plugin.name, plugin.version) for plugin in plugins], [("test", "1")]
         )
         request.assert_awaited_once_with("GET", "info")
+
+    async def test_v3_fetch_plugins_uses_unprefixed_route(self) -> None:
+        """Lavalink v3 exposes plugins at /plugins, not /v3/plugins."""
+        node = make_node(3)
+        node._base_uri = URL("http://localhost:2333")
+        node._rest_uri = node._base_uri / "v3"
+        request = AsyncMock(return_value=[{"name": "test", "version": "1"}])
+
+        with patch.object(Node, "_Node__request", request):
+            plugins = await node.fetch_plugins()
+
+        self.assertEqual(
+            [(plugin.name, plugin.version) for plugin in plugins], [("test", "1")]
+        )
+        request.assert_awaited_once_with("GET", URL("http://localhost:2333/plugins"))
 
     async def test_disabled_routeplanner_returns_none(self) -> None:
         """A 204 routeplanner response maps to None."""
