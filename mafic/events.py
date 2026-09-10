@@ -151,8 +151,9 @@ class TrackExceptionEvent(Generic[PlayerT]):
     ----------
     track: :class:`Track`
         The track that caused the exception.
-    exception: :class:`Exception`
-        The exception that was raised.
+    exception: :class:`dict`
+        The exception data sent by Lavalink, with ``severity``, ``message``,
+        ``cause`` and ``causeStackTrace`` keys.
     player: :class:`Player`
         The player that the event was dispatched from.
     """

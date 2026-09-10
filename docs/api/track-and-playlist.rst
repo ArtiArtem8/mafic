@@ -39,8 +39,9 @@ also carry metadata::
        user_data={"request_id": "abc"},
    )
 
-Lavalink returns the same object on every v4 track event, so it can be used to match an
-event to one playback attempt::
+Lavalink v4 track events carry the track that the event is about, including the
+:attr:`Track.user_data` that was provided when it was played, so an event can be matched
+to one playback attempt::
 
    @bot.listen()
    async def on_track_end(event: mafic.TrackEndEvent) -> None:
