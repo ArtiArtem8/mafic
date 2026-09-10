@@ -4,11 +4,11 @@ Thank you for your interest in contributing to mafic! We welcome contributions f
 
 ## I Have a Question
 
-For questions and support, please use the [Discussions Page](https://github.com/ooliver1/mafic/discussions).
+For questions and support, please use the [Issues Page](https://github.com/artiartem8/mafic/issues).
 
 ## I Found a Bug
 
-Please report bugs to the [Issues Page](https://github.com/nextcord/nextcord/issues/new/choose). Before reporting a bug, please do the following:
+Please report bugs to the [Issues Page](https://github.com/artiartem8/mafic/issues). Before reporting a bug, please do the following:
 
 - Search the issue tracker to see if someone has already reported the bug.
 - If your issue involves a traceback, please include **all** of it. It contains important information that can help us diagnose the problem including where the issue occured.
@@ -21,6 +21,13 @@ Please report bugs to the [Issues Page](https://github.com/nextcord/nextcord/iss
   - Information **about your environment.** This includes your operating system, Python version, version of mafic, version of lavalink, and any other relevant information.
 
 Without providing this information, solving your issue is harder, and may be impossible, so please help us help you.
+
+### Fork or Upstream?
+
+This repository is a maintained fork of [ooliver1/mafic](https://github.com/ooliver1/mafic), not the upstream project, so the two issue trackers are not interchangeable:
+
+- Report issues in this fork here. Its Lavalink v4 support, the supported Python and Discord library versions, its packaging and the installation instructions in the README are all fork-specific.
+- If the same issue reproduces with an unmodified upstream release, it belongs to [upstream Mafic](https://github.com/ooliver1/mafic/issues). Fixes for those are still welcome here as pull requests.
 
 ## Creating a Pull Request
 

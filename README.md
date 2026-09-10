@@ -14,34 +14,42 @@
 > Upstream changes are kept separate so fixes can still be contributed back
 > as focused pull requests.
 
-[![MIT License](https://custom-icon-badges.demolab.com/github/license/ooliver1/mafic?color=845ec2&logo=code-square)](https://github.com/ooliver1/mafic/blob/master/LICENSE "License File")
-[![Releases](https://custom-icon-badges.demolab.com/github/v/release/ooliver1/mafic?display_name=tag&include_prereleases&sort=semver&logo=commit&color=c25db8)](https://github.com/ooliver1/mafic/releases "Mafic Releases")
-[![Discord](https://img.shields.io/discord/864563184919773226?color=f062a4&logo=discord&logoColor=white)](https://discord.gg/mMvUABNegY "Discord Server")
-[![Lint Workflow Status](https://custom-icon-badges.demolab.com/github/actions/workflow/status/ooliver1/mafic/lint.yml?label=lint&logo=codescan-checkmark&color=ff738c)](https://github.com/ooliver1/mafic/actions/workflows/lint.yml "Lint Workflow")
-[![PyPI - Status](https://img.shields.io/pypi/status/mafic?color=ff9075&label=PyPI&logo=pypi&logoColor=white)](https://pypi.org/project/mafic "Mafic PyPI Project")
-[![Open Issues](https://custom-icon-badges.demolab.com/github/issues-raw/ooliver1/mafic?logo=issue-opened&color=ffb263)](https://github.com/ooliver1/mafic/issues "Open Issues")
-[![Open PRs](https://custom-icon-badges.demolab.com/github/issues-pr-raw/ooliver1/mafic?logo=git-pull-request&color=ffd55f)](https://github.com/ooliver1/mafic/pulls "Open Pull Requests")
-[![Read the Docs](https://img.shields.io/readthedocs/mafic?logo=read%20the%20docs&logoColor=white&color=f9f871)](https://mafic.readthedocs.io/en/latest/)
+[![MIT License](https://custom-icon-badges.demolab.com/github/license/artiartem8/mafic?color=845ec2&logo=code-square)](https://github.com/artiartem8/mafic/blob/maintained/lavalink-v4/LICENSE "License File")
+[![Lint Workflow Status](https://custom-icon-badges.demolab.com/github/actions/workflow/status/artiartem8/mafic/lint.yml?label=lint&logo=codescan-checkmark&color=ff738c)](https://github.com/artiartem8/mafic/actions/workflows/lint.yml "Lint Workflow")
+[![Upstream PyPI - Status](https://img.shields.io/pypi/status/mafic?color=ff9075&label=upstream%20PyPI&logo=pypi&logoColor=white)](https://pypi.org/project/mafic "Upstream Mafic on PyPI")
+[![Open Issues](https://custom-icon-badges.demolab.com/github/issues-raw/artiartem8/mafic?logo=issue-opened&color=ffb263)](https://github.com/artiartem8/mafic/issues "Open Issues")
+[![Open PRs](https://custom-icon-badges.demolab.com/github/issues-pr-raw/artiartem8/mafic?logo=git-pull-request&color=ffd55f)](https://github.com/artiartem8/mafic/pulls "Open Pull Requests")
+[![Upstream Documentation](https://img.shields.io/readthedocs/mafic?logo=read%20the%20docs&logoColor=white&color=f9f871)](https://mafic.readthedocs.io/en/latest/ "Upstream Mafic documentation")
 
 A properly typehinted lavalink client for discord.py, nextcord, disnake and py-cord.
 
 ## Installation
 
+Install this fork from the `maintained/lavalink-v4` branch:
+
 ```bash
-pip install mafic
+pip install "mafic @ git+https://github.com/artiartem8/mafic.git@maintained/lavalink-v4"
+```
+
+> **Note**
+> `pip install mafic` installs the
+> [upstream PyPI release](https://pypi.org/project/mafic "Upstream Mafic on PyPI"),
+> which does not contain this fork's Lavalink v4 fixes.
+
+For production, pin an exact commit instead of the moving branch:
+
+```bash
+pip install "mafic @ git+https://github.com/artiartem8/mafic.git@<commit-sha>"
 ```
 
 > **Note**
 > Use `python -m`, `py -m`, `python3 -m` or similar if that is how you install packages.
 > Generally windows uses `py -m pip` and linux uses `python3 -m pip`
 
-## Discord Server
-
-[Join the Discord Server](https://discord.gg/mMvUABNegY) for support and updates.
-
 ## Documentation
 
-[Read the docs](https://mafic.readthedocs.io/en/latest/).
+[Upstream documentation](https://mafic.readthedocs.io/en/latest/) covers the shared
+Mafic API; this fork adds the Lavalink v4 fixes described above.
 
 ## Features
 
@@ -107,7 +115,3 @@ async def play(inter: nextcord.Interaction, query: str):
 
 bot.run(...)
 ```
-
-## Acknowledgements
-
-- Used generative AI.
