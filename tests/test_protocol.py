@@ -197,10 +197,9 @@ class VoiceStateTests(IsolatedAsyncioTestCase):
         player._voice_state_update_event = Event()
         dispatch = AsyncMock()
 
-        with (
-            patch("mafic.player.VoiceChannel", FakeVoiceChannel),
-            patch.object(Player, "_dispatch_player_update", dispatch),
-        ):
+        channel_patch = patch("mafic.player.VoiceChannel", FakeVoiceChannel)
+        dispatch_patch = patch.object(Player, "_dispatch_player_update", dispatch)
+        with channel_patch, dispatch_patch:
             await player.on_voice_state_update(
                 cast(
                     "object",
@@ -245,10 +244,9 @@ class TransferMetadataTests(IsolatedAsyncioTestCase):
         player._filters = OrderedDict()
         update = AsyncMock()
 
-        with (
-            patch("mafic.player.VoiceChannel", FakeVoiceChannel),
-            patch.object(Player, "update", update),
-        ):
+        channel_patch = patch("mafic.player.VoiceChannel", FakeVoiceChannel)
+        update_patch = patch.object(Player, "update", update)
+        with channel_patch, update_patch:
             await player.transfer_to(cast("Node[Client]", new_node))
 
         if update.await_args is None:
