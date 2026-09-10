@@ -3,12 +3,12 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from .track import Track
 
 if TYPE_CHECKING:
-    from .typings import PlaylistInfo, TrackWithInfo
+    from .typings import JSONObject, PlaylistInfo, TrackWithInfo
 
 __all__ = ("Playlist",)
 
@@ -24,7 +24,7 @@ class Playlist:
         The index of the selected track, if any.
     tracks: :class:`list`\[:class:`Track`]
         A list of tracks in the playlist.
-    plugin_info: :class:`dict`\[:class:`str`, :class:`Any`]
+    plugin_info: :class:`dict`
         A dictionary containing plugin-specific information.
 
         .. versionadded:: 2.3
@@ -37,11 +37,11 @@ class Playlist:
         *,
         info: PlaylistInfo,
         tracks: list[TrackWithInfo],
-        plugin_info: dict[str, Any],
+        plugin_info: JSONObject,
     ) -> None:
         self.name: str = info["name"]
         self.selected_track: int = info["selectedTrack"]
         self.tracks: list[Track] = [
             Track.from_data_with_info(track) for track in tracks
         ]
-        self.plugin_info: dict[str, Any] = plugin_info
+        self.plugin_info: JSONObject = dict(plugin_info)

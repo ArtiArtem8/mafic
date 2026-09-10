@@ -6,9 +6,11 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from typing import Mapping
+
     from typing_extensions import Self
 
-    from .typings import TrackInfo, TrackWithInfo
+    from .typings import JSONValue, TrackInfo, TrackWithInfo
 
 __all__ = ("Track",)
 
@@ -69,6 +71,10 @@ class Track:
         This is always ``None`` if the node does not use Lavalink v4.
 
         .. versionadded:: 2.2
+    plugin_info: :class:`dict`
+        Additional track information returned by Lavalink plugins.
+    user_data: :class:`dict`
+        JSON-compatible data associated with this playback by Lavalink.
     """
 
     __slots__ = (
@@ -79,11 +85,13 @@ class Track:
         "isrc",
         "length",
         "position",
+        "plugin_info",
         "seekable",
         "source",
         "stream",
         "title",
         "uri",
+        "user_data",
     )
 
     def __init__(
@@ -101,6 +109,8 @@ class Track:
         artwork_url: str | None,
         isrc: str | None,
         source: str,
+        plugin_info: Mapping[str, JSONValue] | None = None,
+        user_data: Mapping[str, JSONValue] | None = None,
     ) -> None:
         self.id: str = track_id
 
@@ -120,9 +130,18 @@ class Track:
 
         self.artwork_url: str | None = artwork_url
         self.isrc: str | None = isrc
+        self.plugin_info: dict[str, JSONValue] = dict(plugin_info or {})
+        self.user_data: dict[str, JSONValue] = dict(user_data or {})
 
     @classmethod
-    def from_data(cls, *, track: str, info: TrackInfo) -> Self:
+    def from_data(
+        cls,
+        *,
+        track: str,
+        info: TrackInfo,
+        plugin_info: Mapping[str, JSONValue] | None = None,
+        user_data: Mapping[str, JSONValue] | None = None,
+    ) -> Self:
         """Create a track from the raw data.
 
         Parameters
@@ -131,6 +150,10 @@ class Track:
             The ID of the track.
         info:
             The track info.
+        plugin_info:
+            Additional track information returned by Lavalink plugins.
+        user_data:
+            JSON-compatible data associated with the track by Lavalink.
 
         Returns
         -------
@@ -150,6 +173,8 @@ class Track:
             length=info["length"],
             artwork_url=info.get("artworkUrl"),
             isrc=info.get("isrc"),
+            plugin_info=plugin_info,
+            user_data=user_data,
         )
 
     @classmethod
@@ -166,7 +191,12 @@ class Track:
         :class:`Track`
             The track.
         """
-        return cls.from_data(track=data["encoded"], info=data["info"])
+        return cls.from_data(
+            track=data["encoded"],
+            info=data["info"],
+            plugin_info=data.get("pluginInfo"),
+            user_data=data.get("userData"),
+        )
 
     def __repr__(self) -> str:
         """Return the string representation of this track."""

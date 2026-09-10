@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Literal, TypedDict
 
-from .misc import PayloadWithGuild
+from .misc import JSONObject, PayloadWithGuild
 
 if TYPE_CHECKING:
     from typing_extensions import NotRequired
@@ -144,6 +144,9 @@ class TrackInfo(TypedDict):
 class TrackWithInfo(TypedDict):
     encoded: str
     info: TrackInfo
+    # Lavalink 4.0.1 could omit these fields due to protocol bugs.
+    pluginInfo: NotRequired[JSONObject]
+    userData: NotRequired[JSONObject]
 
 
 class Memory(TypedDict):
