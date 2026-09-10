@@ -562,7 +562,7 @@ class Filter:
 
         .. describe:: x |= y
 
-            Merges two filters together, favouring attributes from x, assigning to x.
+            Merges two filters together, favouring attributes from y, assigning to x.
 
         .. describe:: x & y
 
@@ -570,7 +570,7 @@ class Filter:
 
         .. describe:: x &= y
 
-            Merges two filters together, favouring attributes from y, assigning to x.
+            Merges two filters together, favouring attributes from x, assigning to x.
 
     .. versionchanged:: 2.1
 
@@ -805,30 +805,21 @@ class Filter:
             raise TypeError(msg)
 
         return Filter(
-            equalizer=other.equalizer
-            if other.equalizer is not None
-            else self.equalizer,
-            karaoke=other.karaoke if other.karaoke is not None else self.karaoke,
-            timescale=other.timescale
-            if other.timescale is not None
-            else self.timescale,
-            tremolo=other.tremolo if other.tremolo is not None else self.tremolo,
-            vibrato=other.vibrato if other.vibrato is not None else self.vibrato,
-            rotation=other.rotation if other.rotation is not None else self.rotation,
-            distortion=(
-                other.distortion if other.distortion is not None else self.distortion
-            ),
-            channel_mix=(
-                other.channel_mix if other.channel_mix is not None else self.channel_mix
-            ),
-            low_pass=other.low_pass if other.low_pass is not None else self.low_pass,
-            # volume can legitimately be 0.0, so it cannot be merged with `or`.
+            equalizer=other.equalizer or self.equalizer,
+            karaoke=other.karaoke or self.karaoke,
+            timescale=other.timescale or self.timescale,
+            tremolo=other.tremolo or self.tremolo,
+            vibrato=other.vibrato or self.vibrato,
+            rotation=other.rotation or self.rotation,
+            distortion=other.distortion or self.distortion,
+            channel_mix=other.channel_mix or self.channel_mix,
+            low_pass=other.low_pass or self.low_pass,
+            # 0.0 is a valid volume, so it cannot be merged with `or`.
             volume=other.volume if other.volume is not None else self.volume,
-            # An empty plugin filter map is indistinguishable from an unset one.
             plugin_filters=other.plugin_filters or self.plugin_filters,
         )
 
-    def __ior__(self, other: Filter) -> None:
+    def __ior__(self, other: Filter) -> Self:
         """Merge two filters together, favouring attributes from other, in place."""
         if not isinstance(
             other, Filter
@@ -836,39 +827,20 @@ class Filter:
             msg = f"Expected Filter instance, not {type(other)!r}"
             raise TypeError(msg)
 
-        if other.equalizer is not None:
-            self.equalizer = other.equalizer
+        self.equalizer = other.equalizer or self.equalizer
+        self.karaoke = other.karaoke or self.karaoke
+        self.timescale = other.timescale or self.timescale
+        self.tremolo = other.tremolo or self.tremolo
+        self.vibrato = other.vibrato or self.vibrato
+        self.rotation = other.rotation or self.rotation
+        self.distortion = other.distortion or self.distortion
+        self.channel_mix = other.channel_mix or self.channel_mix
+        self.low_pass = other.low_pass or self.low_pass
+        # 0.0 is a valid volume, so it cannot be merged with `or`.
+        self.volume = other.volume if other.volume is not None else self.volume
+        self.plugin_filters = other.plugin_filters or self.plugin_filters
 
-        if other.karaoke is not None:
-            self.karaoke = other.karaoke
-
-        if other.timescale is not None:
-            self.timescale = other.timescale
-
-        if other.tremolo is not None:
-            self.tremolo = other.tremolo
-
-        if other.vibrato is not None:
-            self.vibrato = other.vibrato
-
-        if other.rotation is not None:
-            self.rotation = other.rotation
-
-        if other.distortion is not None:
-            self.distortion = other.distortion
-
-        if other.channel_mix is not None:
-            self.channel_mix = other.channel_mix
-
-        if other.low_pass is not None:
-            self.low_pass = other.low_pass
-
-        if other.volume is not None:
-            self.volume = other.volume
-
-        # An empty plugin filter map is indistinguishable from an unset one.
-        if other.plugin_filters:
-            self.plugin_filters = other.plugin_filters
+        return self
 
     def __and__(self, other: Filter) -> Filter:
         """Merge two filters together, favouring attributes from self."""
@@ -879,26 +851,21 @@ class Filter:
             raise TypeError(msg)
 
         return Filter(
-            equalizer=self.equalizer if self.equalizer is not None else other.equalizer,
-            karaoke=self.karaoke if self.karaoke is not None else other.karaoke,
-            timescale=self.timescale if self.timescale is not None else other.timescale,
-            tremolo=self.tremolo if self.tremolo is not None else other.tremolo,
-            vibrato=self.vibrato if self.vibrato is not None else other.vibrato,
-            rotation=self.rotation if self.rotation is not None else other.rotation,
-            distortion=(
-                self.distortion if self.distortion is not None else other.distortion
-            ),
-            channel_mix=(
-                self.channel_mix if self.channel_mix is not None else other.channel_mix
-            ),
-            low_pass=self.low_pass if self.low_pass is not None else other.low_pass,
-            # volume can legitimately be 0.0, so it cannot be merged with `or`.
+            equalizer=self.equalizer or other.equalizer,
+            karaoke=self.karaoke or other.karaoke,
+            timescale=self.timescale or other.timescale,
+            tremolo=self.tremolo or other.tremolo,
+            vibrato=self.vibrato or other.vibrato,
+            rotation=self.rotation or other.rotation,
+            distortion=self.distortion or other.distortion,
+            channel_mix=self.channel_mix or other.channel_mix,
+            low_pass=self.low_pass or other.low_pass,
+            # 0.0 is a valid volume, so it cannot be merged with `or`.
             volume=self.volume if self.volume is not None else other.volume,
-            # An empty plugin filter map is indistinguishable from an unset one.
             plugin_filters=self.plugin_filters or other.plugin_filters,
         )
 
-    def __iand__(self, other: Filter) -> None:
+    def __iand__(self, other: Filter) -> Self:
         """Merge two filters together, favouring attributes from self, in place."""
         if not isinstance(
             other, Filter
@@ -906,39 +873,20 @@ class Filter:
             msg = f"Expected Filter instance, not {type(other)!r}"
             raise TypeError(msg)
 
-        if self.equalizer is None:
-            self.equalizer = other.equalizer
+        self.equalizer = self.equalizer or other.equalizer
+        self.karaoke = self.karaoke or other.karaoke
+        self.timescale = self.timescale or other.timescale
+        self.tremolo = self.tremolo or other.tremolo
+        self.vibrato = self.vibrato or other.vibrato
+        self.rotation = self.rotation or other.rotation
+        self.distortion = self.distortion or other.distortion
+        self.channel_mix = self.channel_mix or other.channel_mix
+        self.low_pass = self.low_pass or other.low_pass
+        # 0.0 is a valid volume, so it cannot be merged with `or`.
+        self.volume = self.volume if self.volume is not None else other.volume
+        self.plugin_filters = self.plugin_filters or other.plugin_filters
 
-        if self.karaoke is None:
-            self.karaoke = other.karaoke
-
-        if self.timescale is None:
-            self.timescale = other.timescale
-
-        if self.tremolo is None:
-            self.tremolo = other.tremolo
-
-        if self.vibrato is None:
-            self.vibrato = other.vibrato
-
-        if self.rotation is None:
-            self.rotation = other.rotation
-
-        if self.distortion is None:
-            self.distortion = other.distortion
-
-        if self.channel_mix is None:
-            self.channel_mix = other.channel_mix
-
-        if self.low_pass is None:
-            self.low_pass = other.low_pass
-
-        if self.volume is None:
-            self.volume = other.volume
-
-        # An empty plugin filter map is indistinguishable from an unset one.
-        if not self.plugin_filters:
-            self.plugin_filters = other.plugin_filters
+        return self
 
 
 # TODO: people like easy default filters, add some default EQ and combo filters
