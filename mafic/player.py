@@ -354,7 +354,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
         """
         before_session_id = self._session_id
         before_channel_id = (
-            self.channel.id
+            cast(int, self.channel.id)
             if isinstance(self.channel, (VoiceChannel, StageChannel))
             else None
         )

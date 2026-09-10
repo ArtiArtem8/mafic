@@ -4,9 +4,12 @@ This drives Mafic's own REST serialization and Track parsing. It does not cover
 Mafic's websocket or voice handling, which needs a Discord client.
 """
 
+# pyright: reportPrivateUsage=false
+
 from __future__ import annotations
 
 from os import getenv
+from typing import Any
 from unittest import IsolatedAsyncioTestCase, skipUnless
 
 from yarl import URL
@@ -40,7 +43,7 @@ class MaficLavalinkIntegrationTests(IsolatedAsyncioTestCase):
         if INTEGRATION_URL is None or INTEGRATION_PASSWORD is None:
             self.fail("Integration environment was not configured.")
 
-        node: Node[object] = object.__new__(Node)
+        node: Node[Any] = object.__new__(Node)
         node._version = 4
         node._label = "integration"
         node._rest_uri = URL(INTEGRATION_URL) / "v4"
@@ -100,14 +103,20 @@ class MaficLavalinkIntegrationTests(IsolatedAsyncioTestCase):
         track = player["track"]
         if track is None:
             self.fail("Lavalink did not accept the updated track.")
-        self.assertEqual(track["userData"]["correlation_id"], "integration")
+        user_data = track.get("userData")
+        if user_data is None:
+            self.fail("Lavalink did not echo the track user data.")
+        self.assertEqual(user_data["correlation_id"], "integration")
 
         # A subsequent read goes through the same parsing path.
         fetched = await self.node.fetch_player(GUILD_ID)
         track = fetched["track"]
         if track is None:
             self.fail("Lavalink did not report the updated track.")
-        self.assertEqual(track["userData"]["correlation_id"], "integration")
+        user_data = track.get("userData")
+        if user_data is None:
+            self.fail("Lavalink did not report the track user data.")
+        self.assertEqual(user_data["correlation_id"], "integration")
 
         stopped = await self.node.update(guild_id=GUILD_ID, track=None)
         self.assertIsNone(stopped["track"])
