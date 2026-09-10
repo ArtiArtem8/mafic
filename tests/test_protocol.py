@@ -76,6 +76,23 @@ class FilterProtocolTests(TestCase):
         """A valid zero filter volume is not mistaken for omission."""
         self.assertEqual(Filter(volume=0.0).payload, {"volume": 0.0})
 
+    def test_zero_volume_survives_every_merge_operator(self) -> None:
+        """Zero is a valid volume, so a merge must not treat it as unset."""
+        zero = Filter(volume=0.0)
+        other = Filter(volume=1.0)
+
+        cases: list[tuple[str, Filter]] = [
+            ("or", other | zero),
+            ("and", zero & other),
+            ("ior", merge_in_place(other, zero, use_or=True)),
+            ("iand", merge_in_place(zero, other, use_or=False)),
+        ]
+
+        for name, merged in cases:
+            with self.subTest(operator=name):
+                self.assertEqual(merged.volume, 0.0)
+                self.assertEqual(merged.payload, {"volume": 0.0})
+
 
 class MiscProtocolTests(TestCase):
     """Verify corrected stats and routeplanner payload fields."""
