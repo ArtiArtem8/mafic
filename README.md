@@ -34,7 +34,7 @@ pip install "mafic @ git+https://github.com/artiartem8/mafic.git@maintained/lava
 > **Note**
 > `pip install mafic` installs the
 > [upstream PyPI release](https://pypi.org/project/mafic "Upstream Mafic on PyPI"),
-> which does not contain this fork's Lavalink v4 fixes.
+> which is the upstream release, not this maintained fork.
 
 For production, pin an exact commit instead of the moving branch:
 
