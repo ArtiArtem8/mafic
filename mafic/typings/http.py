@@ -4,13 +4,13 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Literal, Optional, TypedDict, Union
+from typing import TYPE_CHECKING, Literal, Optional, TypedDict, Union
 
 if TYPE_CHECKING:
     from typing_extensions import NotRequired
 
     from .common import PlaylistInfo, TrackWithInfo
-    from .misc import LavalinkException
+    from .misc import JSONObject, LavalinkException
 
 
 __all__ = (
@@ -87,7 +87,7 @@ class PlaylistLoadedV4(TypedDict):
 
 class PlaylistDataV4(TypedDict):
     info: PlaylistInfo
-    pluginInfo: dict[str, Any]
+    pluginInfo: JSONObject
     tracks: list[TrackWithInfo]
 
 
@@ -218,6 +218,8 @@ class Version(TypedDict):
     minor: int
     patch: int
     preRelease: str | None
+    # Documented by Lavalink, but omitted by the 4.2.2 implementation.
+    build: NotRequired[str | None]
 
 
 class Git(TypedDict):

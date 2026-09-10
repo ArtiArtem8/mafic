@@ -748,7 +748,7 @@ class Filter:
         if self.low_pass:
             payload["lowPass"] = self.low_pass.payload
 
-        if self.volume:
+        if self.volume is not None:
             payload["volume"] = self.volume
 
         if self.plugin_filters:

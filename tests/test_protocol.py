@@ -65,6 +65,10 @@ class FilterProtocolTests(TestCase):
             {"pluginFilters": {"example-plugin": {"enabled": True, "amount": 0.5}}},
         )
 
+    def test_zero_volume_is_serialized(self) -> None:
+        """A valid zero filter volume is not mistaken for omission."""
+        self.assertEqual(Filter(volume=0.0).payload, {"volume": 0.0})
+
 
 class MiscProtocolTests(TestCase):
     """Verify corrected stats and routeplanner payload fields."""
