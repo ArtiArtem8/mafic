@@ -39,8 +39,11 @@ pip install mafic
 
 ## Usage
 
-Go to the [Lavalink Repository](https://github.com/freyacodes/lavalink#server-configuration)
+Go to the [Lavalink Repository](https://github.com/lavalink-devs/Lavalink#server-configuration)
 to set up a Lavalink node.
+
+Mafic 2.x retains Lavalink 3.7 compatibility. Its Lavalink v4 support is tested
+against stable Lavalink 4.2.2.
 
 ```python
 import os
