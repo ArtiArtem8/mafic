@@ -26,7 +26,13 @@ from .test_player_update import make_node, player_payload
 from .test_track import track_payload
 
 if TYPE_CHECKING:
-    from mafic.__libraries import Client
+    from mafic.__libraries import (
+        Client,
+        Connectable,
+        Guild,
+        GuildVoiceStatePayload,
+        VoiceServerUpdatePayload,
+    )
 
 
 class PlayerStateTests(TestCase):
@@ -156,17 +162,27 @@ class NodeProtocolTests(IsolatedAsyncioTestCase):
 
     async def test_version_4_2_is_supported_without_warning(self) -> None:
         """The version gate recognizes the audited Lavalink minor release."""
+
+        class FakeResponse:
+            async def __aenter__(self) -> FakeResponse:
+                return self
+
+            async def __aexit__(self, *_: object) -> None:
+                return None
+
+            async def text(self) -> str:
+                return "4.2.2"
+
+        class FakeSession:
+            def get(self, *_: object, **__: object) -> FakeResponse:
+                return FakeResponse()
+
         node = make_node(3)
         node._checked_version = False
         node._rest_uri = URL("http://localhost:2333")
         node._ws_uri = URL("ws://localhost:2333")
-        node._Node__password = ""
-        response = AsyncMock()
-        response.text.return_value = "4.2.2"
-        response.__aenter__.return_value = response
-        session = Mock()
-        session.get.return_value = response
-        node._Node__session = session
+        object.__setattr__(node, "_Node__password", "")
+        object.__setattr__(node, "_Node__session", FakeSession())
 
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
@@ -188,12 +204,14 @@ class VoiceStateTests(IsolatedAsyncioTestCase):
             def __init__(self, channel_id: int) -> None:
                 self.id = channel_id
 
+        class FakeGuild:
+            def get_channel(self, _: int) -> FakeVoiceChannel:
+                return FakeVoiceChannel(20)
+
         player: Player[Client] = object.__new__(Player)
         player._session_id = "discord-session"
-        player.channel = cast("object", FakeVoiceChannel(10))
-        player.guild = cast(
-            "object", SimpleNamespace(get_channel=lambda _: FakeVoiceChannel(20))
-        )
+        player.channel = cast("Connectable", FakeVoiceChannel(10))
+        player.guild = cast("Guild", FakeGuild())
         player._voice_state_update_event = Event()
         dispatch = AsyncMock()
 
@@ -202,13 +220,13 @@ class VoiceStateTests(IsolatedAsyncioTestCase):
         with channel_patch, dispatch_patch:
             await player.on_voice_state_update(
                 cast(
-                    "object",
+                    "GuildVoiceStatePayload",
                     {"session_id": "discord-session", "channel_id": "20"},
                 )
             )
 
         dispatch.assert_awaited_once_with()
-        self.assertEqual(player.channel.id, 20)
+        self.assertEqual(cast("FakeVoiceChannel", player.channel).id, 20)
 
 
 class TransferMetadataTests(IsolatedAsyncioTestCase):
@@ -228,12 +246,12 @@ class TransferMetadataTests(IsolatedAsyncioTestCase):
         new_node = SimpleNamespace(add_player=Mock(), voice_update=AsyncMock())
         player: Player[Client] = object.__new__(Player)
         player._node = cast("Node[Client]", old_node)
-        player.guild = cast("object", SimpleNamespace(id=1))
-        player.channel = cast("object", FakeVoiceChannel())
+        player.guild = cast("Guild", SimpleNamespace(id=1))
+        player.channel = cast("Connectable", FakeVoiceChannel())
         player._guild_id = 1
         player._session_id = "discord-session"
         player._server_state = cast(
-            "object",
+            "VoiceServerUpdatePayload",
             {"guild_id": 1, "endpoint": "voice.example.com", "token": "token"},
         )
         player._current = Track.from_data_with_info(track_payload("transfer"))

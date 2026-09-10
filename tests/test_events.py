@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Union, cast
 from unittest import TestCase
 from unittest.mock import Mock
 
@@ -25,12 +25,12 @@ if TYPE_CHECKING:
     )
     from mafic.typings import EventPayload, LavalinkException
 
-    TrackEvent = (
-        TrackStartEvent[Player[Client]]
-        | TrackEndEvent[Player[Client]]
-        | TrackExceptionEvent[Player[Client]]
-        | TrackStuckEvent[Player[Client]]
-    )
+    TrackEvent = Union[
+        TrackStartEvent[Player[Client]],
+        TrackEndEvent[Player[Client]],
+        TrackExceptionEvent[Player[Client]],
+        TrackStuckEvent[Player[Client]],
+    ]
 
 
 class TrackEventMetadataTests(TestCase):

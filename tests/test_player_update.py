@@ -64,7 +64,7 @@ class NodePlayerUpdateTests(IsolatedAsyncioTestCase):
     """Verify version-specific Update Player payloads."""
 
     async def update_payload(
-        self, node: Node[Client], **kwargs: UpdateKwargs
+        self, node: Node[Client], kwargs: UpdateKwargs
     ) -> UpdatePlayerPayload:
         """Run an update and return its serialized JSON payload."""
         request = AsyncMock(return_value=player_payload())
@@ -79,7 +79,7 @@ class NodePlayerUpdateTests(IsolatedAsyncioTestCase):
         """A Track uses canonical v4 nesting and keeps its user data."""
         track = Track.from_data_with_info(track_payload())
 
-        payload = await self.update_payload(make_node(4), track=track)
+        payload = await self.update_payload(make_node(4), {"track": track})
 
         self.assertEqual(
             payload,
@@ -96,7 +96,8 @@ class NodePlayerUpdateTests(IsolatedAsyncioTestCase):
         track = Track.from_data_with_info(track_payload())
 
         payload = await self.update_payload(
-            make_node(4), track=track, user_data={"correlation_id": "override"}
+            make_node(4),
+            {"track": track, "user_data": {"correlation_id": "override"}},
         )
 
         self.assertEqual(
@@ -112,7 +113,8 @@ class NodePlayerUpdateTests(IsolatedAsyncioTestCase):
     async def test_v4_identifier_accepts_user_data(self) -> None:
         """Identifiers can carry user data in the nested v4 track object."""
         payload = await self.update_payload(
-            make_node(4), track="identifier", user_data={"request_id": "abc"}
+            make_node(4),
+            {"track": "identifier", "user_data": {"request_id": "abc"}},
         )
 
         self.assertEqual(
@@ -128,9 +130,9 @@ class NodePlayerUpdateTests(IsolatedAsyncioTestCase):
     async def test_v4_explicit_empty_user_data_is_sent(self) -> None:
         """An explicit empty object differs from an omitted identifier user data."""
         with_empty = await self.update_payload(
-            make_node(4), track="identifier", user_data={}
+            make_node(4), {"track": "identifier", "user_data": {}}
         )
-        omitted = await self.update_payload(make_node(4), track="identifier")
+        omitted = await self.update_payload(make_node(4), {"track": "identifier"})
 
         self.assertEqual(
             with_empty, {"track": {"identifier": "identifier", "userData": {}}}
@@ -139,7 +141,7 @@ class NodePlayerUpdateTests(IsolatedAsyncioTestCase):
 
     async def test_v4_stop_uses_null_nested_encoded_track(self) -> None:
         """Stopping uses track.encoded=null on Lavalink v4."""
-        payload = await self.update_payload(make_node(4), track=None)
+        payload = await self.update_payload(make_node(4), {"track": None})
 
         self.assertEqual(payload, {"track": {"encoded": None}})
 
@@ -148,7 +150,7 @@ class NodePlayerUpdateTests(IsolatedAsyncioTestCase):
         track = Track.from_data_with_info(track_payload())
         track.user_data.clear()
 
-        payload = await self.update_payload(make_node(3), track=track)
+        payload = await self.update_payload(make_node(3), {"track": track})
 
         self.assertEqual(payload, {"encodedTrack": "encoded-track"})
 
@@ -161,8 +163,8 @@ class NodePlayerUpdateTests(IsolatedAsyncioTestCase):
 
     async def test_end_time_distinguishes_omitted_from_null(self) -> None:
         """Omitted endTime leaves state unchanged while null resets it."""
-        omitted = await self.update_payload(make_node(4))
-        reset = await self.update_payload(make_node(4), end_time=None)
+        omitted = await self.update_payload(make_node(4), {})
+        reset = await self.update_payload(make_node(4), {"end_time": None})
 
         self.assertNotIn("endTime", omitted)
         self.assertEqual(reset, {"endTime": None})

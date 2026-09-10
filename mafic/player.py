@@ -353,7 +353,11 @@ class Player(VoiceProtocol, Generic[ClientT]):
             The voice state update payload.
         """
         before_session_id = self._session_id
-        before_channel_id = self.channel.id
+        before_channel_id = (
+            self.channel.id
+            if isinstance(self.channel, (VoiceChannel, StageChannel))
+            else None
+        )
         self._session_id = data["session_id"]
 
         channel_id = data["channel_id"]
