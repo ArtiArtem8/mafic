@@ -83,7 +83,7 @@ class MaficLavalinkIntegrationTests(IsolatedAsyncioTestCase):
         """Mafic sends and parses canonical v4 track metadata."""
         async with self.session.get(f"{INTEGRATION_URL}/version") as response:
             self.assertEqual(response.status, 200)
-            self.assertTrue((await response.text()).startswith("4.2."))
+            self.assertEqual(await response.text(), "4.2.2")
 
         # Decoding goes through Mafic's Track parsing.
         decoded = await self.node.decode_track(ENCODED_TRACK)
