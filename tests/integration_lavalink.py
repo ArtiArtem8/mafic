@@ -1,7 +1,7 @@
 """Opt-in smoke test against a real Lavalink 4.2.2 process.
 
-This drives Mafic's own REST serialization and Track parsing. It does not cover
-Mafic's websocket or voice handling, which needs a Discord client.
+This drives Mafic's websocket connection, REST serialization and Track parsing.
+It does not cover the event loop or voice handling, which needs a Discord client.
 """
 
 # pyright: reportPrivateUsage=false
@@ -9,7 +9,7 @@ Mafic's websocket or voice handling, which needs a Discord client.
 from __future__ import annotations
 
 from os import getenv
-from typing import Any
+from typing import Any, cast
 from unittest import IsolatedAsyncioTestCase, skipUnless
 
 from yarl import URL
@@ -43,7 +43,7 @@ class MaficLavalinkIntegrationTests(IsolatedAsyncioTestCase):
         if INTEGRATION_URL is None or INTEGRATION_PASSWORD is None:
             self.fail("Integration environment was not configured.")
 
-        node: Node[Any] = object.__new__(Node)
+        node: Node[Any] = cast("Node[Any]", object.__new__(Node))
         node._version = 4
         node._label = "integration"
         node._rest_uri = URL(INTEGRATION_URL) / "v4"
@@ -67,9 +67,13 @@ class MaficLavalinkIntegrationTests(IsolatedAsyncioTestCase):
                 "Client-Name": "Mafic/integration",
             }
         )
-        self.websocket = await self.session.ws_connect(
-            f"{INTEGRATION_URL}/v4/websocket"
-        )
+        self.node._ws_uri = URL(INTEGRATION_URL) / "v4" / "websocket"
+        self.node._timeout = 10
+        self.node._heartbeat = 15
+        await self.node._connect_to_websocket(dict(self.session.headers), self.session)
+        if self.node._ws is None:
+            self.fail("Mafic did not establish a websocket connection.")
+        self.websocket = self.node._ws
         ready = await self.websocket.receive_json(timeout=10)
         self.assertEqual(ready["op"], "ready")
         self.node._session_id = ready["sessionId"]

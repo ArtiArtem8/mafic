@@ -1,4 +1,5 @@
 """A Player is used to connect to a channel."""
+
 # SPDX-License-Identifier: MIT
 
 from __future__ import annotations
@@ -9,7 +10,6 @@ from asyncio import Event
 from collections import OrderedDict
 from functools import reduce
 from logging import getLogger
-from operator import or_
 from time import time
 from typing import TYPE_CHECKING, Generic, cast
 
@@ -81,6 +81,9 @@ class Player(VoiceProtocol, Generic[ClientT]):
         This is a ``Guild`` from your Discord library.
     """
 
+    # VoiceProtocol is not generic; preserve the concrete client subtype.
+    client: ClientT
+
     def __init__(
         self,
         client: ClientT,
@@ -88,7 +91,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
         *,
         node: Node[ClientT] | None = None,
     ) -> None:
-        self.client: ClientT = client
+        self.client = client  # pyright: ignore[reportIncompatibleVariableOverride]
         self.channel: Connectable = channel
 
         if not isinstance(self.channel, GuildChannel):
@@ -354,7 +357,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
         """
         before_session_id = self._session_id
         before_channel_id = (
-            cast(int, self.channel.id)
+            self.channel.id
             if isinstance(self.channel, (VoiceChannel, StageChannel))
             else None
         )
@@ -566,7 +569,11 @@ class Player(VoiceProtocol, Generic[ClientT]):
             position=self.position,
             volume=state["volume"],
             pause=self._paused,
-            filter=reduce(or_, self._filters.values()) if self._filters else Filter(),
+            filter=(
+                reduce(lambda left, right: left | right, self._filters.values())
+                if self._filters
+                else Filter()
+            ),
         )
 
         await old_node.destroy(guild_id=self.guild.id)
@@ -817,7 +824,11 @@ class Player(VoiceProtocol, Generic[ClientT]):
             Whether to seek to the current position after updating the filters.
         """
         await self.update(
-            filter=reduce(or_, self._filters.values()) if self._filters else Filter()
+            filter=(
+                reduce(lambda left, right: left | right, self._filters.values())
+                if self._filters
+                else Filter()
+            )
         )
 
         if fast_apply:

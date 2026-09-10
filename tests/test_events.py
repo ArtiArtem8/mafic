@@ -1,4 +1,5 @@
 """Tests for Lavalink v4 track events."""
+
 # pyright: reportPrivateUsage=false
 
 from __future__ import annotations
@@ -39,7 +40,7 @@ class TrackEventMetadataTests(TestCase):
     def setUp(self) -> None:
         """Build a minimal connected v4 player."""
         self.dispatch = Mock()
-        self.player: Player[Client] = object.__new__(Player)
+        self.player: Player[Client] = cast("Player[Client]", object.__new__(Player))
         self.player._node = make_node(4)
         self.player.client = cast("Client", SimpleNamespace(dispatch=self.dispatch))
         self.player._current = Track.from_data_with_info(track_payload("current"))
@@ -101,7 +102,9 @@ class TrackEventMetadataTests(TestCase):
             ),
         ]
 
-        for payload, expected in zip(cases, ("start", "end", "exception", "stuck")):
+        for payload, expected in zip(
+            cases, ("start", "end", "exception", "stuck"), strict=True
+        ):
             with self.subTest(event_type=payload["type"]):
                 event = self.dispatch_track_event(payload)
                 self.assertEqual(event.track.user_data["correlation_id"], expected)

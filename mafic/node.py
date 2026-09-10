@@ -1,4 +1,5 @@
 """Node class to represent one Lavalink instance."""
+
 # SPDX-License-Identifier: MIT
 # pyright: reportImportCycles=false
 # Player import.
@@ -559,13 +560,14 @@ class Node(Generic[ClientT]):
             The session to use for the websocket connection.
         """
         try:
-            self._ws = (
-                await session.ws_connect(  # pyright: ignore[reportUnknownMemberType]
-                    self._ws_uri,
-                    timeout=self._timeout,
-                    heartbeat=self._heartbeat,
-                    headers=headers,
-                )
+            self._ws = await session.ws_connect(  # pyright: ignore[reportUnknownMemberType]
+                self._ws_uri,
+                # aiohttp uses attr.ib, whose generated parameters are untyped.
+                timeout=aiohttp.ClientWSTimeout(
+                    ws_close=self._timeout,  # pyright: ignore[reportCallIssue]
+                ),
+                heartbeat=self._heartbeat,
+                headers=headers,
             )
         except Exception as e:
             _log.error(
@@ -768,7 +770,7 @@ class Node(Generic[ClientT]):
                 self._ws = None
 
                 wait_time = backoff.delay()
-                _log.warn(
+                _log.warning(
                     "Websocket was closed from host %s port %s with RFC 6455 code %s. "
                     "Reconnecting in %.2fs",
                     self._host,
@@ -862,7 +864,7 @@ class Node(Generic[ClientT]):
         else:
             # Of course pyright considers this to be `Never`, so this is to keep types.
             op = cast(str, data["op"])
-            _log.warn("Unknown incoming message op code %s", op)
+            _log.warning("Unknown incoming message op code %s", op)
 
     async def _handle_event(self, data: EventPayload) -> None:
         """Handle an event from the websocket.
@@ -1158,7 +1160,7 @@ class Node(Generic[ClientT]):
             method,
             uri,
             json=json,
-            params=params,
+            params=cast("Mapping[str, str] | None", params),
             headers={"Authorization": self.__password},
         ) as resp:
             _log.debug("Received status %s from lavalink.", resp.status)

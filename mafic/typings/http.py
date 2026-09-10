@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: MIT
-# ruff: noqa: UP013
 # `class` in `TypedDict` does not work as that is a reserved keyword
 
 from __future__ import annotations
@@ -38,14 +37,6 @@ __all__ = (
     "TrackLoadingResult",
     "TracksFailed",
     "Version",
-    "Git",
-    "Info",
-    "RotatingIPRoutePlanner",
-    "NanoIPRoutePlanner",
-    "RotatingNanoIPRoutePlanner",
-    "BalancingIPRoutePlanner",
-    "EmptyRoutePlanner",
-    "RoutePlannerStatus",
 )
 
 
@@ -183,8 +174,7 @@ RotatingNanoIPRoutePlanner = TypedDict(
 )
 
 
-class BalancingIPRouteDetails(BaseDetails):
-    ...
+class BalancingIPRouteDetails(BaseDetails): ...
 
 
 BalancingIPRoutePlanner = TypedDict(

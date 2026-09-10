@@ -1,9 +1,10 @@
 """Tests for Lavalink player update serialization."""
+
 # pyright: reportPrivateUsage=false
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING, TypedDict, cast
 from unittest import IsolatedAsyncioTestCase
 from unittest.mock import AsyncMock, patch
 
@@ -53,7 +54,7 @@ def player_payload(correlation_id: str = "request-a") -> PlayerPayload:
 
 def make_node(version: int) -> Node[Client]:
     """Build the minimal Node state needed by Node.update."""
-    node: Node[Client] = object.__new__(Node)
+    node: Node[Client] = cast("Node[Client]", object.__new__(Node))
     node._version = version
     node._session_id = "lavalink-session"
     node._label = "TEST"
@@ -176,7 +177,7 @@ class PlayerPlayTests(IsolatedAsyncioTestCase):
     async def test_play_sends_track_user_data(self) -> None:
         """Player.play preserves Track.user_data by default."""
         node = make_node(4)
-        player: Player[Client] = object.__new__(Player)
+        player: Player[Client] = cast("Player[Client]", object.__new__(Player))
         player._node = node
         player._connected = True
         player._guild_id = 1
@@ -201,7 +202,7 @@ class PlayerPlayTests(IsolatedAsyncioTestCase):
     async def test_play_forwards_explicit_user_data(self) -> None:
         """Player.play forwards an explicit user data object."""
         node = make_node(4)
-        player: Player[Client] = object.__new__(Player)
+        player: Player[Client] = cast("Player[Client]", object.__new__(Player))
         player._node = node
         player._connected = True
         player._guild_id = 1
@@ -230,7 +231,7 @@ class PlayerPlayTests(IsolatedAsyncioTestCase):
     async def test_play_can_clear_track_user_data(self) -> None:
         """An explicit empty object replaces a Track's existing metadata."""
         node = make_node(4)
-        player: Player[Client] = object.__new__(Player)
+        player: Player[Client] = cast("Player[Client]", object.__new__(Player))
         player._node = node
         player._connected = True
         player._guild_id = 1

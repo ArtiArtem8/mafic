@@ -1,4 +1,5 @@
 """Tests for Lavalink 4.2 protocol alignment."""
+
 # pyright: reportPrivateUsage=false
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ class PlayerStateTests(TestCase):
 
     def test_set_state_reads_player_state_and_track_metadata(self) -> None:
         """Sync/resume reconstruction keeps state and complete track metadata."""
-        player: Player[Client] = object.__new__(Player)
+        player: Player[Client] = cast("Player[Client]", object.__new__(Player))
         player._guild_id = 1
 
         player.set_state(player_payload("resumed"))
@@ -244,7 +245,7 @@ class VoiceStateTests(IsolatedAsyncioTestCase):
             def get_channel(self, _: int) -> FakeVoiceChannel:
                 return FakeVoiceChannel(20)
 
-        player: Player[Client] = object.__new__(Player)
+        player: Player[Client] = cast("Player[Client]", object.__new__(Player))
         player._session_id = "discord-session"
         player.channel = cast("Connectable", FakeVoiceChannel(10))
         player.guild = cast("Guild", FakeGuild())
@@ -280,7 +281,7 @@ class TransferMetadataTests(IsolatedAsyncioTestCase):
             destroy=AsyncMock(),
         )
         new_node = SimpleNamespace(add_player=Mock(), voice_update=AsyncMock())
-        player: Player[Client] = object.__new__(Player)
+        player: Player[Client] = cast("Player[Client]", object.__new__(Player))
         player._node = cast("Node[Client]", old_node)
         player.guild = cast("Guild", SimpleNamespace(id=1))
         player.channel = cast("Connectable", FakeVoiceChannel())

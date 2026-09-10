@@ -31,33 +31,48 @@ classifiers = [
 packages = [{ include = "mafic" }]
 
 [tool.poetry.dependencies]
-python = "^3.8"
-aiohttp = "^3.6.0"
-orjson = { version = "^3.8.0", optional = true }
-yarl = "^1.0.0"
+python = ">=3.12,<3.15"
+aiohttp = "^3.14.3"
+orjson = { version = "^3.12.0", optional = true }
+yarl = "^1.24.5"
 
 [tool.poetry.extras]
 speedups = ["orjson"]
 
 [tool.poetry.group.dev.dependencies]
-pyright = "1.1.306"
-black = "^22.8.0"
-taskipy = "^1.10.3"
-pre-commit = "^2.20.0"
-python-dotenv = "^0.21.0"
-slotscheck = "^0.15.0"
-typing-extensions = "^4.3.0"
-ruff = "^0.0.251"
+pyright = "1.1.414"
+black = "26.5.1"
+taskipy = "1.14.1"
+pre-commit = "4.6.2"
+python-dotenv = { version = "1.2.3", extras = ["cli"] }
+slotscheck = "0.21.0"
+typing-extensions = "4.16.0"
+ruff = "0.16.6"
 
+# The default development environment uses one Discord library.
 [tool.poetry.group.lint.dependencies]
-nextcord = [
-    { version = "^3.0.1", python = "^3.12"},
-    { version = "^2.0.0", python = "<3.12" },
-]
-disnake = "^2.0.0"
-py-cord = "^2.0.0"
-"discord.py" = "^2.0.0"
-orjson = "^3.5.0"
+nextcord = "3.2.0"
+
+[tool.poetry.group.disnake]
+optional = true
+
+[tool.poetry.group.disnake.dependencies]
+disnake = "2.12.1"
+
+[tool.poetry.group.discordpy]
+optional = true
+
+[tool.poetry.group.discordpy.dependencies]
+"discord.py" = "2.7.1"
+
+[tool.poetry.group.pycord]
+optional = true
+
+[tool.poetry.group.pycord.dependencies]
+py-cord = { version = "2.8.1", extras = ["voice"] }
+
+[tool.poetry.group.docs]
+optional = true
 
 [tool.poetry.group.docs.dependencies]
 sphinx = "^6.1.3"
@@ -73,16 +88,16 @@ sphinx-autodoc-typehints = "^1.21.8"
 pre-commit = "pre-commit install --install-hooks"
 lint = "pre-commit run --all-files"
 black = "task lint black"
-ruff = "task lint ruff"
+ruff = "task lint ruff-check"
 slotscheck = "task lint slotscheck"
 pyright = "dotenv -f task.env run -- pyright"
 docs = "cd docs && sphinx-autobuild . _build/html --ignore _build --watch ../mafic --port 8069"
 
 [tool.black]
 line-length = 88
-target-version = ["py38", "py39", "py310"]
+target-version = ["py312"]
 
-[tool.ruff.isort]
+[tool.ruff.lint.isort]
 combine-as-imports = true
 
 [tool.slotscheck]
@@ -92,10 +107,15 @@ require-subclass = false
 
 [tool.pyright]
 typeCheckingMode = "strict"
-pythonVersion = "3.8"
+pythonVersion = "3.12"
+include = ["mafic", "tests"]
 ignore = ["test_bot", "examples/**"]
 
 [tool.ruff]
+target-version = "py312"
+extend-exclude = [".venv*"]
+
+[tool.ruff.lint]
 select = [
     "E",
     "F",
@@ -121,7 +141,7 @@ select = [
     "RSE",
     "RET",
     "SIM",
-    "TCH",
+    "TC",
     "ARG",
     "PGH",
     "PLC",
@@ -134,20 +154,20 @@ select = [
 # F403, F405 do not need to hate wildcard imports. Pyright can find undefined errors.
 # D107, class docstr is in the class level, may change in future.
 # D203 and D211, D212 and D213 intentionally clash
-# ANN101, ANN102 ask for `self` and `cls` annotations, what?
 # RET505-RET508 does not allow for any branches where it is an elif and else after a return
 # PLR2004 too much to deal with right now
 # PLR0913 a bit of a churn to deal with for Client and Filter
-# UP006-UP007, UP035,UP038 currently supporting 3.8, would like to keep Optional when needed
+# Keep existing annotation style; a tooling upgrade is not a typing rewrite.
 # S311 I do not need cryptographically secure random node selection thanks
 ignore = [
+    # Preserve the existing API/annotation layout during the tooling migration.
+    "UP017", "UP041", "UP042", "UP045", "UP046", "UP047",
+    "RUF022", "RUF023", "TC006", "PLC0415",
     "F403",
     "F405",
     "D107",
     "D203",
     "D213",
-    "ANN101",
-    "ANN102",
     "RET505",
     "RET506",
     "RET507",
@@ -159,15 +179,14 @@ ignore = [
     "UP006",
     "UP007",
     "UP035",
-    "UP038",
     "S311",
 ]
 unfixable = ["RET502", "RET503"]
 
-[tool.ruff.pydocstyle]
+[tool.ruff.lint.pydocstyle]
 convention = "numpy"
 
-[tool.ruff.per-file-ignores]
+[tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
 "mafic/typings/*" = ["D"]
 "test_bot/*" = ["D", "ANN", "S101", "S106", "RET"]
@@ -175,5 +194,5 @@ convention = "numpy"
 "examples/*" = ["D", "ANN", "S101", "S106", "RET"]
 
 [build-system]
-requires = ["poetry-core"]
+requires = ["poetry-core>=2.4,<3"]
 build-backend = "poetry.core.masonry.api"

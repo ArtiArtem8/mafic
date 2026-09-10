@@ -1,4 +1,6 @@
-/poetry.lock
 __pycache__/
 *.pyc
 dist/
+
+.venv*/
+.vscode/

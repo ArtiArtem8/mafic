@@ -1,4 +1,5 @@
 """Tests for Track metadata across Lavalink REST paths."""
+
 # pyright: reportPrivateUsage=false
 
 from __future__ import annotations
