@@ -98,6 +98,7 @@ class SearchResultV4(TypedDict):
 
 class SearchEmptyV4(TypedDict):
     loadType: Literal["empty"]
+    data: None
 
 
 class LoadErrorV4(TypedDict):
@@ -129,7 +130,7 @@ class IPBlock(TypedDict):
 
 
 class FailingIPAddress(TypedDict):
-    address: str
+    failingAddress: str
     failingTimestamp: int
     failingTime: str
 

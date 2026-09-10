@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Literal, TypedDict
 
-from .misc import JSONObject, PayloadWithGuild
+from .misc import JSONObject, JSONValue, PayloadWithGuild
 
 if TYPE_CHECKING:
     from typing_extensions import NotRequired
@@ -18,6 +18,7 @@ __all__ = (
     "Karaoke",
     "LowPass",
     "Player",
+    "PlayerState",
     "PlaylistInfo",
     "Rotation",
     "Timescale",
@@ -99,12 +100,21 @@ class Filters(TypedDict, total=False):
     distortion: Distortion
     channelMix: ChannelMix
     lowPass: LowPass
+    pluginFilters: dict[str, JSONValue]
+
+
+class PlayerState(TypedDict):
+    time: int
+    position: int
+    connected: bool
+    ping: int
 
 
 class Player(PayloadWithGuild):
     track: TrackWithInfo | None
     volume: int
     paused: bool
+    state: PlayerState
     voice: VoiceState
     filters: Filters
 
@@ -116,9 +126,11 @@ class VoiceStateRequest(TypedDict):
     channelId: str
 
 
-class VoiceState(VoiceStateRequest):
-    connected: bool
-    ping: int
+class VoiceState(TypedDict):
+    token: str
+    endpoint: str
+    sessionId: str
+    channelId: str | None
 
 
 class PlaylistInfo(TypedDict):
@@ -158,8 +170,8 @@ class Memory(TypedDict):
 
 class CPU(TypedDict):
     cores: int
-    systemLoad: int
-    lavalinkLoad: int
+    systemLoad: float
+    lavalinkLoad: float
 
 
 class FrameStats(TypedDict):

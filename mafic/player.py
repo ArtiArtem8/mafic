@@ -126,7 +126,10 @@ class Player(VoiceProtocol, Generic[ClientT]):
             You should not need to use this.
         """
         self._session_id = state["voice"]["sessionId"]
-        self._ping = state["voice"].get("ping", -1)
+        self._last_update = state["state"]["time"]
+        self._position = state["state"]["position"]
+        self._connected = state["state"]["connected"]
+        self._ping = state["state"]["ping"]
         self._current = (
             Track.from_data_with_info(state["track"]) if state["track"] else None
         )
@@ -137,8 +140,6 @@ class Player(VoiceProtocol, Generic[ClientT]):
             "endpoint": state["voice"]["endpoint"],
             "guild_id": self._guild_id,
         }
-        if state["track"]:
-            self._position = state["track"]["info"]["position"]
 
     def __repr__(self) -> str:
         """Return a string representation of the player."""

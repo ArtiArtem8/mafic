@@ -6,9 +6,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from json import dumps
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from typing_extensions import Self
 
     from .typings import (
@@ -16,6 +19,7 @@ if TYPE_CHECKING:
         Distortion as DistortionPayload,
         EQBand as EQBandPayload,
         Filters,
+        JSONValue,
         Karaoke as KaraokePayload,
         LowPass as LowPassPayload,
         Rotation as RotationPayload,
@@ -598,6 +602,8 @@ class Filter:
         The low pass filter to use.
     volume: :data:`~typing.Optional`\[:class:`float`]
         The volume to use.
+    plugin_filters: :class:`dict`
+        JSON-compatible filter configurations keyed by Lavalink plugin name.
     """
 
     __slots__ = (
@@ -610,6 +616,7 @@ class Filter:
         "distortion",
         "channel_mix",
         "low_pass",
+        "plugin_filters",
         "volume",
     )
 
@@ -630,6 +637,7 @@ class Filter:
         channel_mix: ChannelMix | None = None,
         low_pass: LowPass | None = None,
         volume: float | None = None,
+        plugin_filters: Mapping[str, JSONValue] | None = None,
     ) -> None:
         self.equalizer: Equalizer | None = self._convert_equalizer(equalizer)
         self.karaoke: Karaoke | None = karaoke
@@ -641,6 +649,7 @@ class Filter:
         self.channel_mix: ChannelMix | None = channel_mix
         self.low_pass: LowPass | None = low_pass
         self.volume: float | None = volume
+        self.plugin_filters: dict[str, JSONValue] = dict(plugin_filters or {})
 
     def _convert_equalizer(
         self,
@@ -672,6 +681,7 @@ class Filter:
                 self.channel_mix,
                 self.low_pass,
                 self.volume,
+                dumps(self.plugin_filters, sort_keys=True, separators=(",", ":")),
             )
         )
 
@@ -691,6 +701,7 @@ class Filter:
             and self.channel_mix == other.channel_mix
             and self.low_pass == other.low_pass
             and self.volume == other.volume
+            and self.plugin_filters == other.plugin_filters
         )
 
     def __repr__(self) -> str:
@@ -740,6 +751,9 @@ class Filter:
         if self.volume:
             payload["volume"] = self.volume
 
+        if self.plugin_filters:
+            payload["pluginFilters"] = dict(self.plugin_filters)
+
         return payload
 
     @classmethod
@@ -777,6 +791,9 @@ class Filter:
         if "volume" in data:
             self.volume = data["volume"]
 
+        if "pluginFilters" in data:
+            self.plugin_filters = dict(data["pluginFilters"])
+
         return self
 
     def __or__(self, other: Filter) -> Filter:
@@ -798,6 +815,7 @@ class Filter:
             channel_mix=other.channel_mix or self.channel_mix,
             low_pass=other.low_pass or self.low_pass,
             volume=other.volume or self.volume,
+            plugin_filters=other.plugin_filters or self.plugin_filters,
         )
 
     def __ior__(self, other: Filter) -> None:
@@ -818,6 +836,7 @@ class Filter:
         self.channel_mix = other.channel_mix or self.channel_mix
         self.low_pass = other.low_pass or self.low_pass
         self.volume = other.volume or self.volume
+        self.plugin_filters = other.plugin_filters or self.plugin_filters
 
     def __and__(self, other: Filter) -> Filter:
         """Merge two filters together, favouring attributes from self."""
@@ -838,6 +857,7 @@ class Filter:
             channel_mix=self.channel_mix or other.channel_mix,
             low_pass=self.low_pass or other.low_pass,
             volume=self.volume or other.volume,
+            plugin_filters=self.plugin_filters or other.plugin_filters,
         )
 
     def __iand__(self, other: Filter) -> None:
@@ -858,6 +878,7 @@ class Filter:
         self.channel_mix = self.channel_mix or other.channel_mix
         self.low_pass = self.low_pass or other.low_pass
         self.volume = self.volume or other.volume
+        self.plugin_filters = self.plugin_filters or other.plugin_filters
 
 
 # TODO: people like easy default filters, add some default EQ and combo filters

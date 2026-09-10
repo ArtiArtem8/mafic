@@ -25,9 +25,9 @@ class CPUStats:
     ----------
     cores: :class:`int`
         The number of cores the node has.
-    system_load: :class:`int`
+    system_load: :class:`float`
         The load on the whole system lavalink is on..
-    lavalink_load: :class:`int`
+    lavalink_load: :class:`float`
         The load Lavalink is using.
     """
 
@@ -35,8 +35,8 @@ class CPUStats:
 
     def __init__(self, payload: CPU) -> None:
         self.cores: int = payload["cores"]
-        self.system_load: int = payload["systemLoad"]
-        self.lavalink_load: int = payload["lavalinkLoad"]
+        self.system_load: float = payload["systemLoad"]
+        self.lavalink_load: float = payload["lavalinkLoad"]
 
 
 class MemoryStats:

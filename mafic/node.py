@@ -53,6 +53,7 @@ if TYPE_CHECKING:
         Coro,
         EventPayload,
         IncomingMessage,
+        Info,
         JSONValue,
         OutgoingMessage,
         OutgoingParams,
@@ -496,7 +497,7 @@ class Node(Generic[ClientT]):
         :class:`UnsupportedVersionWarning`
             If the
             - major version is 3 and the minor version is more than 7
-            - major version is 4 and the minor version is more than 0
+            - major version is 4 and the minor version is more than 2
             Some features may not work.
         """
         if self._checked_version:
@@ -534,7 +535,7 @@ class Node(Generic[ClientT]):
                         "(expected 3.7.x or 4.x.x)"
                     )
                     raise RuntimeError(msg)
-                elif (major == 3 and minor > 7) or (major == 4 and minor > 0):
+                elif (major == 3 and minor > 7) or (major == 4 and minor > 2):
                     message = UnsupportedVersionWarning.message
                     warnings.warn(message, UnsupportedVersionWarning, stacklevel=4)
 
@@ -1294,7 +1295,11 @@ class Node(Generic[ClientT]):
         :class:`list`\[:class:`Plugin`]
             The plugins from the node.
         """
-        plugins: list[PluginData] = await self.__request("GET", "plugins")
+        if self._version == 3:
+            plugins: list[PluginData] = await self.__request("GET", "plugins")
+        else:
+            info: Info = await self.__request("GET", "info")
+            plugins = info["plugins"]
 
         return [Plugin(plugin) for plugin in plugins]
 
@@ -1306,11 +1311,13 @@ class Node(Generic[ClientT]):
         :data:`.RoutePlannerStatus`
             The route planner status from the node.
         """
-        data: RoutePlannerStatusPayload = await self.__request(
+        data: RoutePlannerStatusPayload | None = await self.__request(
             "GET", "routeplanner/status"
         )
 
-        if data["class"] == "RotatingIpRoutePlanner":
+        if data is None or data["class"] is None:
+            return None
+        elif data["class"] == "RotatingIpRoutePlanner":
             return RotatingIPRoutePlannerStatus(
                 cast(RotatingIPRouteDetails, data["details"])
             )
@@ -1324,8 +1331,6 @@ class Node(Generic[ClientT]):
             return BalancingIPRoutePlannerStatus(
                 cast(BalancingIPRouteDetails, data["details"])
             )
-        elif data["class"] is None:
-            return None
         else:
             msg = f"Unknown route planner class {data['class']}."
             raise RuntimeError(msg)

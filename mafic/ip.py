@@ -113,9 +113,9 @@ class FailingAddress:
     __slots__ = ("address", "time")
 
     def __init__(self, data: FailingIPAddress) -> None:
-        self.address: str = data["address"]
+        self.address: str = data["failingAddress"]
         self.time: datetime = datetime.fromtimestamp(
-            data["failingTimestamp"], tz=timezone.utc
+            data["failingTimestamp"] / 1_000, tz=timezone.utc
         )
 
 

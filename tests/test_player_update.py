@@ -35,13 +35,17 @@ def player_payload(correlation_id: str = "request-a") -> PlayerPayload:
         "track": track_payload(correlation_id),
         "volume": 100,
         "paused": False,
+        "state": {
+            "time": 1_000,
+            "position": 250,
+            "connected": True,
+            "ping": 5,
+        },
         "voice": {
             "token": "token",
             "endpoint": "endpoint",
             "sessionId": "discord-session",
             "channelId": "10",
-            "connected": True,
-            "ping": 5,
         },
         "filters": {},
     }
