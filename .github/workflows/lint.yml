@@ -2,65 +2,111 @@ name: lint
 
 on:
   push:
-    branches:
-      - master
+    branches: [maintained/lavalink-v4]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  POETRY_VERSION: "2.4.3"
+  POETRY_VIRTUALENVS_IN_PROJECT: "true"
 
 jobs:
-  pyright:
+  compatibility:
     runs-on: ubuntu-latest
     strategy:
-      matrix:
-        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
       fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v3
-
-      - name: Set up python
-        id: setup-python
-        uses: actions/setup-python@v2
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
-
-      - name: Load cached Poetry installation
-        uses: actions/cache@v4
-        with:
-          path: ~/.local
-          key: poetry-${{ matrix.python-version }}-${{ hashFiles('**/pyproject.toml') }}
-
       - name: Install Poetry
-        uses: snok/install-poetry@v1
+        run: pipx install "poetry==$POETRY_VERSION"
+      - name: Check manifest and lock
+        run: poetry check --lock
+      - name: Test each Discord library in isolation
+        shell: bash
+        run: |
+          for group in lint disnake discordpy pycord; do
+            echo "::group::Python ${{ matrix.python-version }} / $group"
+            # Separate environments prevent discord.py/py-cord file collisions.
+            python -m venv "$RUNNER_TEMP/mafic-$group"
+            export VIRTUAL_ENV="$RUNNER_TEMP/mafic-$group"
+            poetry sync --only "main,dev,$group" --extras speedups --no-interaction
+            poetry run python -c "import mafic; from mafic.__libraries import library, version_info; print(library, version_info)"
+            poetry run python -m unittest discover -s tests -t .
+            poetry run python -m slotscheck -m mafic
+            echo "::endgroup::"
+          done
+      - name: Install type checking dependencies
+        # The adapter imports all three namespaces. Never mix the discord providers.
+        run: poetry sync --only main,dev,lint,disnake,discordpy --extras speedups --no-interaction
+      - name: Check types
+        run: poetry run pyright --pythonversion "${{ matrix.python-version }}" --pythonplatform Linux
+      - name: Check formatting and lint
+        run: |
+          poetry run black --check .
+          poetry run ruff check .
+      - name: Run all pre-commit hooks
+        if: matrix.python-version == '3.12'
+        run: poetry run task lint
+
+  lavalink:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      LAVALINK_INTEGRATION_URL: http://127.0.0.1:2333
+      LAVALINK_INTEGRATION_PASSWORD: mafic-local-integration
+    steps:
+      - uses: actions/checkout@v7
         with:
-          version: 1.8.5
-
-      - name: Export dependencies
-        run: poetry export --no-interaction -f requirements.txt --output requirements.txt --with lint,docs,dev
-
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
       - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Set up pyright
-        run: echo "PYRIGHT_VERSION=$(python -c 'import pyright; print(pyright.__pyright_version__)')" >> $GITHUB_ENV
-
-      - name: Run pyright (Linux)
-        uses: jakebailey/pyright-action@v2
-        with:
-          version: ${{ env.PYRIGHT_VERSION }}
-          python-version: ${{ matrix.python-version }}
-          python-platform: Linux
-          # only add comments for 3.8
-          no-comments: ${{ matrix.python-version != '3.8' }}
-          warnings: true
-
-      - name: Run pyright (Windows)
-        uses: jakebailey/pyright-action@v2
-        # run anyway
-        if: success() || failure()
-        with:
-          version: ${{ env.PYRIGHT_VERSION }}
-          python-version: ${{ matrix.python-version }}
-          python-platform: Windows
-          # only add comments for one platform
-          no-comments: true
-          warnings: true
+        run: |
+          pipx install "poetry==$POETRY_VERSION"
+          poetry sync --only main,lint --extras speedups --no-interaction
+      - name: Test against Lavalink 4.2.2
+        shell: bash
+        run: |
+          curl --fail --location --retry 3 \
+            https://github.com/lavalink-devs/Lavalink/releases/download/4.2.2/Lavalink.jar \
+            --output "$RUNNER_TEMP/Lavalink.jar"
+          cd "$RUNNER_TEMP"
+          java -jar Lavalink.jar \
+            --server.address=127.0.0.1 --server.port=2333 \
+            --lavalink.server.password="$LAVALINK_INTEGRATION_PASSWORD" \
+            --lavalink.server.sources.youtube=true > lavalink.log 2>&1 &
+          lavalink_pid=$!
+          trap 'kill "$lavalink_pid" 2>/dev/null || true' EXIT
+          ready=false
+          for attempt in {1..60}; do
+            if curl --fail --silent -H "Authorization: $LAVALINK_INTEGRATION_PASSWORD" \
+              "$LAVALINK_INTEGRATION_URL/version" > version.txt; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" != true ] || [ "$(cat version.txt)" != 4.2.2 ]; then
+            cat lavalink.log
+            exit 1
+          fi
+          cd "$GITHUB_WORKSPACE"
+          poetry run python -m unittest tests.integration_lavalink -v || {
+            cat "$RUNNER_TEMP/lavalink.log"
+            exit 1
+          }
