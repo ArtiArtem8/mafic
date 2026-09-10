@@ -4,11 +4,10 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
 from enum import Enum, auto
 from logging import getLogger
 from random import choice
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from .node import Node
 from .region import VoiceRegion

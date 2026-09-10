@@ -4,11 +4,10 @@ r"""A module containing a :class:`NodePool`, used to manage :class:`Node`\s."""
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
 from functools import partial
 from logging import getLogger
 from random import choice
-from typing import TYPE_CHECKING, Any, Generic, TypeVar, Union, cast
+from typing import TYPE_CHECKING, Any, Generic, Sequence, TypeVar, Union, cast
 
 from .errors import NoNodesAvailable, PlayerNotConnected
 from .node import Node
