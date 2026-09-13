@@ -8,6 +8,7 @@ import asyncio
 import warnings
 from asyncio import Event, Lock
 from collections import OrderedDict
+from copy import copy as shallow_copy
 from functools import reduce
 from logging import getLogger
 from time import time
@@ -121,6 +122,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
         self._node_player_ready_event: Event = Event()
         self._move_lock: Lock = Lock()
         self._voice_update_lock: Lock = Lock()
+        self._disconnecting: bool = False
 
     def set_state(self, state: PlayerPayload) -> None:
         """Set the state of the player.
@@ -599,23 +601,25 @@ class Player(VoiceProtocol, Generic[ClientT]):
         if self.client.is_closed():
             return
 
+        self._disconnecting = True
         _log.debug(
             "Disconnecting player and destroying client.",
             extra={"guild": self._guild_id},
         )
-        if self._node is not None:
-            self._node.remove_player(self.guild.id)
-            await self._node.destroy(guild_id=self.guild.id)
+        async with self._voice_update_lock:
+            if self._node is not None:
+                self._node.remove_player(self.guild.id)
+                await self._node.destroy(guild_id=self.guild.id)
 
-        try:
-            _log.debug(
-                "Disconnecting from voice channel.",
-                extra={"guild": self._guild_id},
-            )
-            await self.guild.change_voice_state(channel=None)
-        finally:
-            self.cleanup()
-            self._connected = False
+            try:
+                _log.debug(
+                    "Disconnecting from voice channel.",
+                    extra={"guild": self._guild_id},
+                )
+                await self.guild.change_voice_state(channel=None)
+            finally:
+                self.cleanup()
+                self._connected = False
 
     def cleanup(self) -> None:
         """Clean up the player.
@@ -682,15 +686,26 @@ class Player(VoiceProtocol, Generic[ClientT]):
             msg = "Cannot transfer player without playback state."
             raise RuntimeError(msg)
 
-        snapshot_track = (
-            Track.from_data_with_info(snapshot["track"])
-            if snapshot["track"] is not None
-            else None
-        )
+        if old_node.version == 3:
+            if snapshot["track"] is None:
+                snapshot_track = None
+            elif self._current is None:
+                msg = "Cannot restore Lavalink v3 track without local metadata."
+                raise RuntimeError(msg)
+            else:
+                snapshot_track = shallow_copy(self._current)
+                snapshot_track.id = cast("str", snapshot["track"])
+        else:
+            snapshot_track = (
+                Track.from_data_with_info(snapshot["track"])
+                if snapshot["track"] is not None
+                else None
+            )
         snapshot_filter = Filter.from_payload(snapshot["filters"])
 
-        # Prepare the target before committing ownership. A failed target
-        # preparation must not destroy the old node's working player.
+        # Temporarily register the target so websocket events emitted by the
+        # target preparation can still find this Player. Ownership stays old.
+        node.add_player(self.guild.id, self)
         try:
             await node.voice_update(
                 guild_id=self._guild_id,
@@ -707,6 +722,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
                 filter=snapshot_filter,
             )
         except Exception:
+            node.remove_player(self.guild.id)
             try:
                 await node.destroy(guild_id=self.guild.id)
             except Exception:  # noqa: BLE001 - best-effort partial cleanup
@@ -716,28 +732,40 @@ class Player(VoiceProtocol, Generic[ClientT]):
                 )
             raise
 
+        if self._disconnecting:
+            node.remove_player(self.guild.id)
+            try:
+                await node.destroy(guild_id=self.guild.id)
+            except Exception:  # noqa: BLE001 - best-effort partial cleanup
+                _log.exception(
+                    "Failed to clean up partial target node player.",
+                    extra={"guild": self.guild.id},
+                )
+            raise PlayerNotConnected
+
         # Commit ownership only after the target is fully prepared.
-        node.add_player(self.guild.id, self)
         self._node = node
         old_node.remove_player(self.guild.id)
 
         # Sync playback state from the actual target response. Voice credentials
         # remain owned by on_voice_server_update; do not let a transient target
         # response replace the authoritative Discord server state.
-        self._current = (
-            Track.from_data_with_info(target_state["track"])
-            if target_state["track"] is not None
-            else None
-        )
+        if node.version == 3:
+            self._current = snapshot_track
+        else:
+            self._current = (
+                Track.from_data_with_info(target_state["track"])
+                if target_state["track"] is not None
+                else None
+            )
         self._last_update = target_state["state"]["time"]
         self._position = target_state["state"]["position"]
         self._connected = target_state["state"]["connected"]
         self._ping = target_state["state"]["ping"]
         self._volume = target_state["volume"]
         self._paused = target_state["paused"]
-        self._filters = OrderedDict(
-            {"RESUME": Filter.from_payload(target_state["filters"])}
-        )
+        # Keep local labeled filters as metadata. Lavalink returns one merged
+        # filter payload, so labels cannot be reconstructed from the response.
 
         # The migration is committed; old cleanup is best-effort.
         try:

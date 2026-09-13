@@ -19,7 +19,7 @@ from yarl import URL
 
 from mafic.__libraries import Client, Guild, StageChannel, VoiceChannel, library
 from mafic.errors import PlayerNotConnected
-from mafic.filter import Filter
+from mafic.filter import Filter, Timescale
 from mafic.ip import FailingAddress
 from mafic.node import Node
 from mafic.player import Player
@@ -735,7 +735,10 @@ class NodeTransferTests(IsolatedAsyncioTestCase):
         self.guild = Mock(spec=Guild, id=1)
         self.channel = Mock(spec=VoiceChannel, id=10, guild=self.guild)
         self.guild.get_channel.side_effect = {10: self.channel}.get
-        self.client = cast("Client", Mock(spec=Client))
+        self.guild.change_voice_state = AsyncMock()
+        client = Mock(spec=Client)
+        client.is_closed.return_value = False
+        self.client = cast("Client", client)
         self.player = Player(self.client, cast("VoiceChannel", self.channel))
         self.player._guild_id = 1
         self.player._session_id = "discord-session"
@@ -752,7 +755,7 @@ class NodeTransferTests(IsolatedAsyncioTestCase):
         self.player._filters = OrderedDict()
 
     def make_node(
-        self, label: str, *, payload: PlayerPayload | None = None
+        self, label: str, *, payload: PlayerPayload | None = None, version: int = 4
     ) -> SimpleNamespace:
         """Build a tiny node with an observable player mapping."""
         state = payload if payload is not None else player_payload()
@@ -769,6 +772,7 @@ class NodeTransferTests(IsolatedAsyncioTestCase):
 
         return SimpleNamespace(
             label=label,
+            version=version,
             _players=players,
             add_player=Mock(side_effect=add_player),
             remove_player=Mock(side_effect=remove_player),
@@ -847,8 +851,163 @@ class NodeTransferTests(IsolatedAsyncioTestCase):
         self.assertEqual(self.player._position, 25_000)
         self.assertEqual(self.player._volume, 37)
         self.assertTrue(self.player._paused)
-        resume_filter = self.player._filters["RESUME"]
-        self.assertEqual(resume_filter.payload, server_state["filters"])
+        self.assertTrue(await self.player.has_filter("LOCAL"))
+        self.assertEqual(self.player._filters["LOCAL"].payload, {"volume": 0.25})
+
+    async def test_transfer_preserves_filter_labels(self) -> None:
+        """Transfer keeps local filter labels while using the merged snapshot."""
+        local_filters = OrderedDict(
+            {
+                "bassboost": Filter(volume=0.25),
+                "nightcore": Filter(timescale=Timescale(speed=1.25)),
+            }
+        )
+        merged = Filter(volume=0.25) | Filter(timescale=Timescale(speed=1.25))
+        server_state = player_payload("server")
+        server_state["filters"] = merged.payload
+        old_node = self.make_node("A", payload=server_state)
+        new_node = self.make_node("B", payload=server_state)
+        old_node._players[1] = self.player
+        self.player._node = cast("Node[Client]", old_node)
+        self.player._filters = local_filters
+
+        await self.player.transfer_to(cast("Node[Client]", new_node))
+
+        self.assertTrue(await self.player.has_filter("bassboost"))
+        self.assertTrue(await self.player.has_filter("nightcore"))
+        self.assertEqual(list(self.player._filters), ["bassboost", "nightcore"])
+        if new_node.update.await_args is None:
+            self.fail("Transfer did not restore playback state on the target.")
+        restored_filter = cast("Filter", new_node.update.await_args.kwargs["filter"])
+        self.assertEqual(restored_filter.payload, server_state["filters"])
+
+    async def test_target_registration_keeps_preparation_events(self) -> None:
+        """Temporary target registration lets preparation events reach Player."""
+        old_node = make_node(4)
+        old_node._players = {1: self.player}
+        target_node = make_node(4)
+        target_node._players = {}
+        target_node._event_queue = Event()
+        target_node._event_queue.set()
+        self.player._node = old_node
+        target_state = player_payload("target")
+        target_state["state"]["position"] = 15_000
+        observed = Event()
+
+        async def voice_update(**_: object) -> None:
+            self.assertIs(target_node.get_player(1), self.player)
+            await target_node._handle_msg(
+                {
+                    "op": "playerUpdate",
+                    "guildId": "1",
+                    "state": {
+                        "time": 1_000,
+                        "position": 15_000,
+                        "connected": True,
+                        "ping": 7,
+                    },
+                }
+            )
+            observed.set()
+
+        async def update(**_: object) -> PlayerPayload:
+            return target_state
+
+        with (
+            patch.object(
+                Node, "fetch_player", AsyncMock(return_value=player_payload("old"))
+            ),
+            patch.object(Node, "voice_update", side_effect=voice_update),
+            patch.object(Node, "update", side_effect=update),
+            patch.object(Node, "destroy", AsyncMock()),
+        ):
+            await self.player.transfer_to(target_node)
+
+        self.assertTrue(observed.is_set())
+        self.assertIs(target_node.get_player(1), self.player)
+        self.assertIsNone(old_node.get_player(1))
+        self.assertEqual(self.player._position, 15_000)
+
+    async def test_disconnect_during_blocked_transfer_aborts_target(self) -> None:
+        """Disconnect during target preparation prevents transfer commit."""
+        old_node = self.make_node("A")
+        new_node = self.make_node("B")
+        old_node._players[1] = self.player
+        self.player._node = cast("Node[Client]", old_node)
+        target_preparing, release_target = Event(), Event()
+
+        async def block_voice_update(**_: object) -> None:
+            target_preparing.set()
+            await release_target.wait()
+
+        new_node.voice_update.side_effect = block_voice_update
+        transfer = asyncio.create_task(
+            self.player.transfer_to(cast("Node[Client]", new_node))
+        )
+        await target_preparing.wait()
+
+        disconnect_started = Event()
+
+        async def disconnect() -> None:
+            disconnect_started.set()
+            await self.player.disconnect(force=True)
+
+        with patch.object(Player, "cleanup", Mock()):
+            disconnect_task = asyncio.create_task(disconnect())
+            await disconnect_started.wait()
+            release_target.set()
+            results = await asyncio.gather(
+                transfer, disconnect_task, return_exceptions=True
+            )
+
+        self.assertIsInstance(results[0], PlayerNotConnected)
+        self.assertNotIn(1, old_node._players)
+        self.assertNotIn(1, new_node._players)
+        self.assertIs(self.player._node, old_node)
+        self.assertFalse(self.player.connected)
+
+    async def test_transfer_restores_lavalink_v3_state(self) -> None:
+        """Lavalink v3 encoded track state transfers without v4 parsing."""
+        v3_state = cast(
+            "PlayerPayload",
+            {
+                "guildId": "1",
+                "track": "encoded-track",
+                "volume": 55,
+                "paused": False,
+                "state": {
+                    "time": 1_000,
+                    "position": 333,
+                    "connected": True,
+                    "ping": 5,
+                },
+                "filters": {},
+            },
+        )
+        old_node = self.make_node("A", payload=v3_state, version=3)
+        new_node = self.make_node("B", payload=v3_state, version=3)
+        old_node._players[1] = self.player
+        self.player._node = cast("Node[Client]", old_node)
+
+        await self.player.transfer_to(cast("Node[Client]", new_node))
+
+        if new_node.update.await_args is None:
+            self.fail("Transfer did not restore playback state on the target.")
+        update_kwargs = new_node.update.await_args.kwargs
+        transferred = cast("Track", update_kwargs["track"])
+        self.assertEqual(transferred.id, "encoded-track")
+        self.assertEqual(update_kwargs["position"], 333)
+        self.assertEqual(update_kwargs["volume"], 55)
+        self.assertFalse(update_kwargs["pause"])
+        restored_filter = cast("Filter", update_kwargs["filter"])
+        self.assertEqual(restored_filter.payload, {})
+        current = self.player._current
+        if current is None:
+            self.fail("Transfer did not restore the v3 track.")
+        self.assertEqual(current.id, "encoded-track")
+        self.assertEqual(self.player._position, 333)
+        self.assertEqual(self.player._volume, 55)
+        self.assertFalse(self.player._paused)
 
     async def test_actual_node_update_serializes_track_user_data(self) -> None:
         """The real Node.update payload carries Track.user_data for restore."""
