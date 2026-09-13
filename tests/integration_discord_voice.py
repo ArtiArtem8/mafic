@@ -6,13 +6,16 @@ MAFIC_TEST_GUILD_ID, MAFIC_TEST_VOICE_CHANNEL_IDS (three comma-separated IDs),
 DISCORD_BOT_TOKEN, LAVALINK_INTEGRATION_URL, LAVALINK_INTEGRATION_PASSWORD.
 The exclusive flag attests that the operator checked for other bot instances.
 Credentials must come from local environment/configuration, never fixtures.
+MAFIC_TEST_VOICE_PHASE may select "disconnect" or "sequential" to repeat only
+that experiment; the default "full" runs all phases.
 
 No messages are sent. A connected bot in the target guild aborts the probe.
 There are nine sequential moves, one pair of concurrent moves, and one
 move/disconnect overlap, followed by a fresh connection and cleanup. REST
 sampling is every 100 ms; absence of a sample or close event cannot rule out
-a shorter internal reconnect. Each sequential observation lasts at least one
-second and at most five seconds after return; events are attributed to that
+a shorter internal reconnect. Readiness and settling each use a five-second
+bounded poll. Requests are paced at least one second apart and settling includes
+a half-second event observation window; events are attributed to that
 observation window, not to an invented Discord request identifier.
 """
 
@@ -81,6 +84,10 @@ async def run_probe() -> None:
     if library not in pinned or version(library) != pinned[library]:
         msg = "Use an isolated environment with an audited pinned adapter."
         raise RuntimeError(msg)
+    phase = getenv("MAFIC_TEST_VOICE_PHASE", "full")
+    if phase not in ("full", "disconnect", "sequential"):
+        msg = "MAFIC_TEST_VOICE_PHASE must be full, disconnect, or sequential."
+        raise ValueError(msg)
     guild_id = int(environ["MAFIC_TEST_GUILD_ID"])
     channel_ids = [
         int(value) for value in environ["MAFIC_TEST_VOICE_CHANNEL_IDS"].split(",")
@@ -114,7 +121,8 @@ async def run_probe() -> None:
                 trace.record("OPCODE_4_SEND", channel=data["d"]["channel_id"])
                 trace.sent.set()
 
-        async def on_socket_response(self, message: dict[str, object]) -> None:
+        async def on_socket_raw_receive(self, payload: str | dict[str, object]) -> None:
+            message = loads(payload) if isinstance(payload, str) else payload
             if message.get("t") not in ("VOICE_STATE_UPDATE", "VOICE_SERVER_UPDATE"):
                 return
             data = cast("dict[str, object]", message["d"])
@@ -158,6 +166,7 @@ async def run_probe() -> None:
     voice_update = Node[ProbeClient].voice_update
     handle_msg = Node[ProbeClient]._handle_msg
     previous_voice: tuple[str, str | None, str] | None = None
+    updates_in_flight = 0
 
     async def traced_voice_update(
         node: Node[ProbeClient],
@@ -166,7 +175,7 @@ async def run_probe() -> None:
         data: VoiceServerUpdatePayload,
         channel_id: int,
     ) -> None:
-        nonlocal previous_voice
+        nonlocal previous_voice, updates_in_flight
         current = (session_id, data["endpoint"], data["token"])
         changes = [
             "same" if previous_voice is not None and before == after else "changed"
@@ -182,7 +191,11 @@ async def run_probe() -> None:
             endpoint=changes[1],
             token=changes[2],
         )
-        await voice_update(node, guild_id, session_id, data, channel_id)
+        updates_in_flight += 1
+        try:
+            await voice_update(node, guild_id, session_id, data, channel_id)
+        finally:
+            updates_in_flight -= 1
         trace.record("LAVALINK_VOICE_UPDATE_RETURN", channel=channel_id)
 
     async def traced_message(node: Node[ProbeClient], data: IncomingMessage) -> None:
@@ -210,21 +223,24 @@ async def run_probe() -> None:
     sampler: asyncio.Task[None] | None = None
     moving: asyncio.Task[None] | None = None
     last_sample: tuple[str | None, bool, int] | None = None
+    last_exists: bool | None = None
 
     async def snapshot(source: str) -> tuple[str | None, bool]:
-        nonlocal last_sample
+        nonlocal last_sample, last_exists
         if node is None:
             msg = "Node is not initialized."
             raise RuntimeError(msg)
         try:
             state = await node.fetch_player(guild_id)
         except HTTPNotFound:
-            trace.record("LAVALINK_STATE", source=source, exists=False)
+            if source != "poll" or last_exists is not False:
+                trace.record("LAVALINK_STATE", source=source, exists=False)
+            last_exists = False
             return None, False
         voice_channel = state["voice"].get("channelId")
         connected = state["state"]["connected"]
         current = (voice_channel, connected, state["state"]["ping"])
-        if source != "poll" or current != last_sample:
+        if source != "poll" or current != last_sample or not last_exists:
             trace.record(
                 "LAVALINK_STATE",
                 source=source,
@@ -234,6 +250,7 @@ async def run_probe() -> None:
                 ping=current[2],
             )
         last_sample = current
+        last_exists = True
         return voice_channel, connected
 
     async def sample() -> None:
@@ -265,6 +282,38 @@ async def run_probe() -> None:
                         target=target.id,
                         elapsed=monotonic() - started,
                     )
+                    return
+                await asyncio.sleep(0.1)
+
+    async def settle(target: VoiceChannel, requested_at: float) -> None:
+        # Diagnostic pacing only: an early connected sample can precede a late
+        # server update. Also wait for Mafic's periodic playerUpdate before the
+        # next move, without changing production readiness semantics.
+        async with asyncio.timeout(5):
+            while True:
+                channel, ready = await snapshot("settling")
+                last_event = max(
+                    (
+                        cast("float", row["t"]) + trace.started
+                        for row in trace.rows
+                        if row["event"]
+                        in (
+                            "VOICE_STATE_UPDATE",
+                            "VOICE_SERVER_UPDATE",
+                            "LAVALINK_WEBSOCKET_CLOSE",
+                        )
+                    ),
+                    default=requested_at,
+                )
+                if (
+                    ready
+                    and channel == str(target.id)
+                    and player is not None
+                    and player.connected
+                    and updates_in_flight == 0
+                    and monotonic() >= max(requested_at + 1, last_event + 0.5)
+                ):
+                    trace.record("SETTLED_OBSERVED", target=target.id)
                     return
                 await asyncio.sleep(0.1)
 
@@ -307,16 +356,16 @@ async def run_probe() -> None:
                 secure=url.scheme == "https",
             )
             trace.phase = "connect"
-            player = await channels[0].connect(cls=ProbePlayer, timeout=15)
-            await connected(channels[0])
             sampler = asyncio.create_task(sample())
-            for index in range(9):
+            player = await channels[0].connect(cls=ProbePlayer, timeout=40)
+            await connected(channels[0])
+            for index in range(0 if phase == "disconnect" else 9):
                 trace.phase = f"sequential-{index + 1}"
                 started = monotonic()
                 target = channels[(index + 1) % 3]
                 await move(target)
                 await connected(target)
-                await asyncio.sleep(max(0.5, 1 - (monotonic() - started)))
+                await settle(target, started)
                 rows = [row for row in trace.rows if row["phase"] == trace.phase]
                 states = [row for row in rows if row["event"] == "VOICE_STATE_UPDATE"]
                 servers = [row for row in rows if row["event"] == "VOICE_SERVER_UPDATE"]
@@ -336,57 +385,73 @@ async def run_probe() -> None:
                 if sampler.done():
                     # Surface observer failures before more voice changes.
                     await sampler
-            trace.phase = "concurrent"
-            before_requests = trace.requests
-            results = await asyncio.gather(
-                asyncio.create_task(move(channels[1])),
-                asyncio.create_task(move(channels[2])),
-                return_exceptions=True,
-            )
-            trace.record(
-                "CONCURRENT_RESULTS",
-                requests=trace.requests - before_requests,
-                results=[
-                    type(result).__name__ if isinstance(result, BaseException) else "ok"
-                    for result in results
-                ],
-                final_channel=cast("VoiceChannel", player.channel).id,
-            )
-            await asyncio.sleep(1)
-            trace.phase = "reset-to-A"
-            await move(channels[0])
-            await connected(channels[0])
-            await asyncio.sleep(1)
-            trace.phase = "move-disconnect"
-            trace.sent.clear()
-            moving = asyncio.create_task(move(channels[1]))
-            async with asyncio.timeout(5):
-                await trace.sent.wait()
-            results = await asyncio.gather(
-                moving,
-                player.disconnect(force=True),
-                return_exceptions=True,
-            )
-            # Keep the gateway and node observer alive for late callbacks.
-            await asyncio.sleep(1)
-            trace.record(
-                "DISCONNECT_RESULTS",
-                results=[
-                    type(result).__name__ if isinstance(result, BaseException) else "ok"
-                    for result in results
-                ],
-                discord_channel=(
-                    guild.me.voice.channel.id
-                    if guild.me.voice and guild.me.voice.channel
-                    else None
-                ),
-                mafic_channel=cast("VoiceChannel", player.channel).id,
-                mafic_connected=player.connected,
-            )
-            await snapshot("disconnect_final")
-            trace.phase = "fresh-connect"
-            player = await channels[0].connect(cls=ProbePlayer, timeout=15)
-            await connected(channels[0])
+            if phase == "full":
+                trace.phase = "concurrent"
+                concurrent_started = monotonic()
+                before_requests = trace.requests
+                results = await asyncio.gather(
+                    asyncio.create_task(move(channels[1])),
+                    asyncio.create_task(move(channels[2])),
+                    return_exceptions=True,
+                )
+                trace.record(
+                    "CONCURRENT_RESULTS",
+                    requests=trace.requests - before_requests,
+                    results=[
+                        (
+                            type(result).__name__
+                            if isinstance(result, BaseException)
+                            else "ok"
+                        )
+                        for result in results
+                    ],
+                    final_channel=cast("VoiceChannel", player.channel).id,
+                )
+                # A late close can arrive after both move callers returned.
+                await settle(channels[2], concurrent_started)
+                await asyncio.sleep(1)
+                trace.phase = "recover-after-concurrent"
+                # A failed concurrent experiment may leave voice disconnected.
+                # Use a fresh player before the independent disconnect experiment.
+                await player.disconnect(force=True)
+                await asyncio.sleep(1)
+                player = await channels[0].connect(cls=ProbePlayer, timeout=40)
+                await connected(channels[0])
+            if phase != "sequential":
+                trace.phase = "move-disconnect"
+                trace.sent.clear()
+                moving = asyncio.create_task(move(channels[1]))
+                async with asyncio.timeout(5):
+                    await trace.sent.wait()
+                results = await asyncio.gather(
+                    moving,
+                    player.disconnect(force=True),
+                    return_exceptions=True,
+                )
+                # Keep the gateway and node observer alive for late callbacks.
+                await asyncio.sleep(1)
+                trace.record(
+                    "DISCONNECT_RESULTS",
+                    results=[
+                        (
+                            type(result).__name__
+                            if isinstance(result, BaseException)
+                            else "ok"
+                        )
+                        for result in results
+                    ],
+                    discord_channel=(
+                        guild.me.voice.channel.id
+                        if guild.me.voice and guild.me.voice.channel
+                        else None
+                    ),
+                    mafic_channel=cast("VoiceChannel", player.channel).id,
+                    mafic_connected=player.connected,
+                )
+                await snapshot("disconnect_final")
+                trace.phase = "fresh-connect"
+                player = await channels[0].connect(cls=ProbePlayer, timeout=15)
+                await connected(channels[0])
     finally:
         trace.phase = "cleanup"
         if moving is not None and not moving.done():
