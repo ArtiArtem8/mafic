@@ -707,6 +707,7 @@ class VoiceStateTests(IsolatedAsyncioTestCase):
                 return FakeVoiceChannel(20)
 
         player: Player[Client] = cast("Player[Client]", object.__new__(Player))
+        player._disconnecting = False
         player._session_id = "discord-session"
         player.channel = cast("Connectable", FakeVoiceChannel(10))
         player.guild = cast("Guild", FakeGuild())
@@ -851,8 +852,11 @@ class NodeTransferTests(IsolatedAsyncioTestCase):
         self.assertEqual(self.player._position, 25_000)
         self.assertEqual(self.player._volume, 37)
         self.assertTrue(self.player._paused)
-        self.assertTrue(await self.player.has_filter("LOCAL"))
-        self.assertEqual(self.player._filters["LOCAL"].payload, {"volume": 0.25})
+        self.assertFalse(await self.player.has_filter("LOCAL"))
+        self.assertTrue(await self.player.has_filter("RESUME"))
+        self.assertEqual(
+            self.player._filters["RESUME"].payload, server_state["filters"]
+        )
 
     async def test_transfer_preserves_filter_labels(self) -> None:
         """Transfer keeps local filter labels while using the merged snapshot."""
@@ -881,8 +885,8 @@ class NodeTransferTests(IsolatedAsyncioTestCase):
         restored_filter = cast("Filter", new_node.update.await_args.kwargs["filter"])
         self.assertEqual(restored_filter.payload, server_state["filters"])
 
-    async def test_target_registration_keeps_preparation_events(self) -> None:
-        """Temporary target registration lets preparation events reach Player."""
+    async def test_preparation_events_do_not_touch_player_before_commit(self) -> None:
+        """Target events before commit cannot mutate authoritative Player state."""
         old_node = make_node(4)
         old_node._players = {1: self.player}
         target_node = make_node(4)
@@ -890,12 +894,15 @@ class NodeTransferTests(IsolatedAsyncioTestCase):
         target_node._event_queue = Event()
         target_node._event_queue.set()
         self.player._node = old_node
+        self.player._position = 100
+        old_state = player_payload("old")
+        old_state["state"]["position"] = 100
         target_state = player_payload("target")
-        target_state["state"]["position"] = 15_000
-        observed = Event()
+        target_state["state"]["position"] = 500
+        seen_positions: list[int] = []
 
         async def voice_update(**_: object) -> None:
-            self.assertIs(target_node.get_player(1), self.player)
+            self.assertIsNone(target_node.get_player(1))
             await target_node._handle_msg(
                 {
                     "op": "playerUpdate",
@@ -908,25 +915,23 @@ class NodeTransferTests(IsolatedAsyncioTestCase):
                     },
                 }
             )
-            observed.set()
+            seen_positions.append(self.player._position)
 
         async def update(**_: object) -> PlayerPayload:
             return target_state
 
         with (
-            patch.object(
-                Node, "fetch_player", AsyncMock(return_value=player_payload("old"))
-            ),
+            patch.object(Node, "fetch_player", AsyncMock(return_value=old_state)),
             patch.object(Node, "voice_update", side_effect=voice_update),
             patch.object(Node, "update", side_effect=update),
             patch.object(Node, "destroy", AsyncMock()),
         ):
             await self.player.transfer_to(target_node)
 
-        self.assertTrue(observed.is_set())
+        self.assertEqual(seen_positions, [100])
         self.assertIs(target_node.get_player(1), self.player)
         self.assertIsNone(old_node.get_player(1))
-        self.assertEqual(self.player._position, 15_000)
+        self.assertEqual(self.player._position, 500)
 
     async def test_disconnect_during_blocked_transfer_aborts_target(self) -> None:
         """Disconnect during target preparation prevents transfer commit."""
@@ -963,8 +968,108 @@ class NodeTransferTests(IsolatedAsyncioTestCase):
         self.assertIsInstance(results[0], PlayerNotConnected)
         self.assertNotIn(1, old_node._players)
         self.assertNotIn(1, new_node._players)
-        self.assertIs(self.player._node, old_node)
+        self.assertIsNone(self.player._node)
+        self.assertIsNone(self.player.assigned_node)
         self.assertFalse(self.player.connected)
+
+    async def test_disconnect_clears_assignment(self) -> None:
+        """Disconnect is terminal for the current Player instance."""
+        node = self.make_node("A")
+        node._players[1] = self.player
+        self.player._node = cast("Node[Client]", node)
+
+        with patch.object(Player, "cleanup", Mock()):
+            await self.player.disconnect(force=True)
+
+        self.assertIsNone(self.player._node)
+        self.assertIsNone(self.player.assigned_node)
+        self.assertNotIn(1, node._players)
+        node.destroy.assert_awaited_once_with(guild_id=1)
+        self.guild.change_voice_state.assert_awaited_once_with(channel=None)
+        self.assertFalse(self.player.connected)
+
+    async def test_disconnect_channel_none_reentrancy(self) -> None:
+        """channel=None completion must not recursively disconnect/cleanup."""
+        node = self.make_node("A")
+        node._players[1] = self.player
+        self.player._node = cast("Node[Client]", node)
+        payload = cast(
+            "GuildVoiceStatePayload",
+            {
+                "session_id": "discord-session",
+                "guild_id": "1",
+                "channel_id": None,
+            },
+        )
+        cleanup = Mock()
+
+        async def change_voice_state(
+            *, channel: VoiceChannel | StageChannel | None
+        ) -> None:
+            self.assertIsNone(channel)
+            await self.player.on_voice_state_update(payload)
+
+        self.guild.change_voice_state.side_effect = change_voice_state
+        with patch.object(Player, "cleanup", cleanup):
+            async with asyncio.timeout(1):
+                await self.player.disconnect(force=True)
+
+        self.guild.change_voice_state.assert_awaited_once_with(channel=None)
+        node.destroy.assert_awaited_once_with(guild_id=1)
+        cleanup.assert_called_once()
+        self.assertIsNone(self.player._node)
+        self.assertIsNone(self.player.assigned_node)
+        self.assertFalse(self.player.connected)
+
+    async def test_late_callbacks_after_disconnect_are_ignored(self) -> None:
+        """Late server/state callbacks cannot resurrect a disconnecting Player."""
+        node = self.make_node("A")
+        node._players[1] = self.player
+        self.player._node = cast("Node[Client]", node)
+        self.player._disconnecting = True
+        server_data: VoiceServerUpdatePayload = {
+            "guild_id": 1,
+            "endpoint": "late.example.com",
+            "token": "late-token",
+        }
+        state_data = cast(
+            "GuildVoiceStatePayload",
+            {
+                "session_id": "discord-session",
+                "guild_id": "1",
+                "channel_id": "20",
+            },
+        )
+
+        with (
+            patch("mafic.player.NodePool.get_node") as get_node,
+            patch.object(Node, "voice_update", AsyncMock()) as voice_update,
+        ):
+            await self.player.on_voice_server_update(server_data)
+            await self.player.on_voice_state_update(state_data)
+            await self.player._dispatch_player_update()
+
+        get_node.assert_not_called()
+        voice_update.assert_not_awaited()
+        self.assertIs(self.player._node, node)
+        self.assertEqual(cast("VoiceChannel", self.player.channel).id, 10)
+
+    async def test_transfer_after_disconnect_fails_fast(self) -> None:
+        """Public transfer must not touch target after disconnect started."""
+        old_node = self.make_node("A")
+        new_node = self.make_node("B")
+        old_node._players[1] = self.player
+        self.player._node = cast("Node[Client]", old_node)
+        self.player._disconnecting = True
+
+        with self.assertRaises(PlayerNotConnected):
+            await self.player.transfer_to(cast("Node[Client]", new_node))
+
+        new_node.voice_update.assert_not_awaited()
+        new_node.update.assert_not_awaited()
+        new_node.add_player.assert_not_called()
+        self.assertIs(self.player._node, old_node)
+        self.assertIs(old_node._players[1], self.player)
 
     async def test_transfer_restores_lavalink_v3_state(self) -> None:
         """Lavalink v3 encoded track state transfers without v4 parsing."""

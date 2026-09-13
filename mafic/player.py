@@ -253,6 +253,9 @@ class Player(VoiceProtocol, Generic[ClientT]):
 
     async def _dispatch_player_update_unlocked(self) -> None:
         """Dispatch using current state while holding `_voice_update_lock`."""
+        if self._disconnecting:
+            return
+
         node = self._node
         if node is None:
             _log.debug("Recieved voice update before node was found.")
@@ -382,6 +385,9 @@ class Player(VoiceProtocol, Generic[ClientT]):
         data:
             The voice state update payload.
         """
+        if self._disconnecting:
+            return
+
         before_session_id = self._session_id
         before_channel_id = (
             self.channel.id
@@ -421,6 +427,9 @@ class Player(VoiceProtocol, Generic[ClientT]):
             The voice server update payload.
         """
         async with self._voice_update_lock:
+            if self._disconnecting:
+                return
+
             current_node = self._node
             if (
                 current_node is None
@@ -609,7 +618,10 @@ class Player(VoiceProtocol, Generic[ClientT]):
         async with self._voice_update_lock:
             if self._node is not None:
                 self._node.remove_player(self.guild.id)
-                await self._node.destroy(guild_id=self.guild.id)
+                try:
+                    await self._node.destroy(guild_id=self.guild.id)
+                finally:
+                    self._node = None
 
             try:
                 _log.debug(
@@ -663,6 +675,9 @@ class Player(VoiceProtocol, Generic[ClientT]):
 
     async def _transfer_to_unlocked(self, node: Node[ClientT]) -> None:
         """Transfer ownership while holding `_voice_update_lock`."""
+        if self._disconnecting:
+            raise PlayerNotConnected
+
         old_node = self._node
         if old_node is None:
             raise PlayerNotConnected
@@ -702,10 +717,13 @@ class Player(VoiceProtocol, Generic[ClientT]):
                 else None
             )
         snapshot_filter = Filter.from_payload(snapshot["filters"])
+        local_filter = (
+            reduce(lambda left, right: left | right, self._filters.values())
+            if self._filters
+            else Filter()
+        )
+        labels_match_snapshot = local_filter.payload == snapshot["filters"]
 
-        # Temporarily register the target so websocket events emitted by the
-        # target preparation can still find this Player. Ownership stays old.
-        node.add_player(self.guild.id, self)
         try:
             await node.voice_update(
                 guild_id=self._guild_id,
@@ -722,7 +740,6 @@ class Player(VoiceProtocol, Generic[ClientT]):
                 filter=snapshot_filter,
             )
         except Exception:
-            node.remove_player(self.guild.id)
             try:
                 await node.destroy(guild_id=self.guild.id)
             except Exception:  # noqa: BLE001 - best-effort partial cleanup
@@ -733,7 +750,6 @@ class Player(VoiceProtocol, Generic[ClientT]):
             raise
 
         if self._disconnecting:
-            node.remove_player(self.guild.id)
             try:
                 await node.destroy(guild_id=self.guild.id)
             except Exception:  # noqa: BLE001 - best-effort partial cleanup
@@ -744,6 +760,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
             raise PlayerNotConnected
 
         # Commit ownership only after the target is fully prepared.
+        node.add_player(self.guild.id, self)
         self._node = node
         old_node.remove_player(self.guild.id)
 
@@ -764,8 +781,11 @@ class Player(VoiceProtocol, Generic[ClientT]):
         self._ping = target_state["state"]["ping"]
         self._volume = target_state["volume"]
         self._paused = target_state["paused"]
-        # Keep local labeled filters as metadata. Lavalink returns one merged
-        # filter payload, so labels cannot be reconstructed from the response.
+        if labels_match_snapshot:
+            # Labels already describe the authoritative merged filter payload.
+            pass
+        else:
+            self._filters = OrderedDict({"RESUME": snapshot_filter})
 
         # The migration is committed; old cleanup is best-effort.
         try:
