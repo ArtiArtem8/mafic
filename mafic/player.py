@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import warnings
-from asyncio import Event
+from asyncio import Event, Lock
 from collections import OrderedDict
 from functools import reduce
 from logging import getLogger
@@ -119,6 +119,8 @@ class Player(VoiceProtocol, Generic[ClientT]):
         self._voice_server_update_event: Event = Event()
         self._voice_state_update_event: Event = Event()
         self._node_player_ready_event: Event = Event()
+        self._move_lock: Lock = Lock()
+        self._voice_update_lock: Lock = Lock()
 
     def set_state(self, state: PlayerPayload) -> None:
         """Set the state of the player.
@@ -244,28 +246,33 @@ class Player(VoiceProtocol, Generic[ClientT]):
 
     async def _dispatch_player_update(self) -> None:
         """Dispatch a player update to the node."""
-        if self._node is None:
+        node = self._node
+        if node is None:
             _log.debug("Recieved voice update before node was found.")
             return
 
-        if self._session_id is None:
+        session_id = self._session_id
+        if session_id is None:
             _log.debug("Receieved player update before session ID was set.")
             return
 
-        if self._server_state is None:
+        server_state = self._server_state
+        if server_state is None:
             _log.debug("Receieved player update before server state was found")
             return
 
-        if not isinstance(self.channel, (VoiceChannel, StageChannel)):
+        channel = self.channel
+        if not isinstance(channel, (VoiceChannel, StageChannel)):
             _log.debug("Received player update before channel was set.")
             return
 
-        await self._node.voice_update(
-            guild_id=self._guild_id,
-            session_id=self._session_id,
-            data=self._server_state,
-            channel_id=int(self.channel.id),
-        )
+        async with self._voice_update_lock:
+            await node.voice_update(
+                guild_id=self._guild_id,
+                session_id=session_id,
+                data=server_state,
+                channel_id=int(channel.id),
+            )
 
     def dispatch_event(self, data: EventPayload) -> None:
         """Dispatch an event to the player.
@@ -501,7 +508,8 @@ class Player(VoiceProtocol, Generic[ClientT]):
             The voice or stage channel to move to. Moving to the current channel
             does nothing. Use :meth:`disconnect` to leave voice.
         timeout:
-            Maximum time in seconds to request and confirm the channel change.
+            Maximum time in seconds to wait for earlier moves, request and
+            confirm the channel change.
 
         Raises
         ------
@@ -510,16 +518,25 @@ class Player(VoiceProtocol, Generic[ClientT]):
         ValueError
             If the channel belongs to another guild.
         PlayerNotConnected
-            If the player is not connected to a voice channel.
+            If this player is no longer the guild's active Discord voice protocol.
         asyncio.TimeoutError
             If the voice state callback does not confirm the target in time.
             Discord may still complete the move after this timeout.
 
         Notes
         -----
-        Completion waits for the voice state callback, including its Lavalink
-        voice update. A new voice server update is not required for every move;
-        any that arrives is handled by the existing voice server callback.
+        Moves on this player are serialized in arrival order. Completion confirms
+        the Discord channel transition and the voice state callback's Lavalink
+        request. It does not guarantee a ready Lavalink voice connection: a later
+        voice server update can replace the credentials and trigger reconnection,
+        even after Lavalink briefly reported connected. Server updates are handled
+        independently and are not required to complete every move. Voice updates
+        to Lavalink are serialized per player, so overlapping state/server
+        callbacks preserve their callback order.
+
+        A temporary Lavalink disconnect does not prevent moving an active Discord
+        voice protocol. Disconnect is independent of this queue; an interrupted
+        move may time out, and queued moves recheck the protocol registration.
         """
         if not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
             channel, (VoiceChannel, StageChannel)
@@ -529,29 +546,29 @@ class Player(VoiceProtocol, Generic[ClientT]):
         if channel.guild.id != self.guild.id:
             msg = "Voice channel must belong to the player's guild."
             raise ValueError(msg)
-        if not self._connected:
-            raise PlayerNotConnected
+        async with asyncio.timeout(timeout):
+            async with self._move_lock:
+                if self.guild.voice_client is not self:
+                    raise PlayerNotConnected
+                if (
+                    isinstance(self.channel, (VoiceChannel, StageChannel))
+                    and self.channel.id == channel.id
+                ):
+                    return
 
-        if (
-            isinstance(self.channel, (VoiceChannel, StageChannel))
-            and self.channel.id == channel.id
-        ):
-            return
-
-        self._voice_state_update_event.clear()
-        try:
-            async with asyncio.timeout(timeout):
-                await self.guild.change_voice_state(channel=channel)
-                while True:
-                    await self._voice_state_update_event.wait()
+                self._voice_state_update_event.clear()
+                try:
+                    await self.guild.change_voice_state(channel=channel)
+                    while True:
+                        await self._voice_state_update_event.wait()
+                        self._voice_state_update_event.clear()
+                        if (
+                            isinstance(self.channel, (VoiceChannel, StageChannel))
+                            and self.channel.id == channel.id
+                        ):
+                            return
+                finally:
                     self._voice_state_update_event.clear()
-                    if (
-                        isinstance(self.channel, (VoiceChannel, StageChannel))
-                        and self.channel.id == channel.id
-                    ):
-                        return
-        finally:
-            self._voice_state_update_event.clear()
 
     async def disconnect(self, *, force: bool = False) -> None:
         """Disconnect from the voice channel.

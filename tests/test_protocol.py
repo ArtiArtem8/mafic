@@ -295,6 +295,7 @@ class VoiceStateTests(IsolatedAsyncioTestCase):
             cast("VoiceChannel", self.channel),
             node=make_node(4),
         )
+        self.guild.voice_client = self.player
         self.player._connected = True
         self.player._session_id = "discord-session"
         self.player._server_state = {
@@ -379,6 +380,45 @@ class VoiceStateTests(IsolatedAsyncioTestCase):
                 await callback
                 await move
 
+    async def test_voice_updates_are_serialized(self) -> None:
+        """State/server callbacks cannot issue overlapping voice updates."""
+        first_entered, release_first = Event(), Event()
+        sent_tokens: list[str] = []
+
+        async def voice_update(**kwargs: object) -> None:
+            data = cast("VoiceServerUpdatePayload", kwargs["data"])
+            sent_tokens.append(data["token"])
+            if len(sent_tokens) == 1:
+                first_entered.set()
+                await release_first.wait()
+
+        async def first_server_update() -> None:
+            await self.player.on_voice_server_update(
+                {"guild_id": 1, "endpoint": "voice.example.com", "token": "first-token"}
+            )
+
+        async def second_server_update() -> None:
+            await self.player.on_voice_server_update(
+                {
+                    "guild_id": 1,
+                    "endpoint": "voice.example.com",
+                    "token": "second-token",
+                }
+            )
+
+        self.player.node._players = {}
+        with patch.object(Node, "voice_update", side_effect=voice_update):
+            first = asyncio.create_task(first_server_update())
+            await first_entered.wait()
+            second = asyncio.create_task(second_server_update())
+            await asyncio.sleep(0)
+            self.assertEqual(sent_tokens, ["first-token"])
+            self.assertFalse(second.done())
+            release_first.set()
+            await asyncio.gather(first, second)
+
+        self.assertEqual(sent_tokens, ["first-token", "second-token"])
+
     async def test_move_accepts_stage_channel(self) -> None:
         """The shared voice and stage channel surface works with every adapter."""
         self.target = Mock(spec=StageChannel, id=20, guild=self.guild)
@@ -408,9 +448,189 @@ class VoiceStateTests(IsolatedAsyncioTestCase):
     async def test_move_requires_connected_player(self) -> None:
         """Moving a disconnected player cannot implicitly start a connection."""
         self.player._connected = False
+        self.guild.voice_client = None
         with self.assertRaises(PlayerNotConnected):
             await self.player.move_to(self.target)
         self.guild.change_voice_state.assert_not_awaited()
+
+    async def test_move_during_lavalink_reconnection(self) -> None:
+        """Discord can still move while Lavalink reports a temporary disconnect."""
+        self.player._connected = False
+
+        async def confirm(*, channel: VoiceChannel) -> None:
+            await self.voice_state_update(channel.id)
+
+        self.guild.change_voice_state.side_effect = confirm
+        with patch.object(Node, "voice_update", AsyncMock()):
+            await self.player.move_to(self.target, timeout=1)
+        self.assertIs(self.player.channel, self.target)
+        self.assertFalse(self.player.connected)
+
+    async def test_concurrent_moves_confirm_each_transition_in_order(self) -> None:
+        """The queued move sends only after the first caller has its confirmation."""
+        other = Mock(spec=VoiceChannel, id=30, guild=self.guild)
+        self.guild.get_channel.side_effect = {20: self.target, 30: other}.get
+        queued, first_returned, second_sent = Event(), Event(), Event()
+
+        async def send(*, channel: VoiceChannel) -> None:
+            if channel.id == 20:
+                self.sent.set()
+            else:
+                self.assertTrue(first_returned.is_set())
+                second_sent.set()
+
+        async def first_move() -> None:
+            await self.player.move_to(self.target)
+            first_returned.set()
+
+        async def second_move() -> None:
+            queued.set()
+            await self.player.move_to(other)
+
+        self.guild.change_voice_state.side_effect = send
+        async with asyncio.timeout(1):
+            with patch.object(Node, "voice_update", AsyncMock()):
+                first = asyncio.create_task(first_move())
+                await self.sent.wait()
+                second = asyncio.create_task(second_move())
+                await queued.wait()
+                self.guild.change_voice_state.assert_awaited_once()
+                self.assertFalse(second.done())
+                await self.voice_state_update(20)
+                await first
+                await second_sent.wait()
+                self.assertFalse(second.done())
+                await self.voice_state_update(30)
+                await second
+        self.assertIs(self.player.channel, other)
+
+    async def test_queued_current_channel_is_rechecked(self) -> None:
+        """Moving back to the original channel cannot become an early no-op."""
+        queued, second_sent = Event(), Event()
+
+        async def send(*, channel: VoiceChannel) -> None:
+            (self.sent if channel.id == 20 else second_sent).set()
+
+        async def return_to_original() -> None:
+            queued.set()
+            await self.player.move_to(self.channel)
+
+        self.guild.change_voice_state.side_effect = send
+        async with asyncio.timeout(1):
+            with patch.object(Node, "voice_update", AsyncMock()):
+                first = asyncio.create_task(self.player.move_to(self.target))
+                await self.sent.wait()
+                second = asyncio.create_task(return_to_original())
+                await queued.wait()
+                self.assertFalse(second.done())
+                await self.voice_state_update(20)
+                await first
+                await second_sent.wait()
+                await self.voice_state_update(10)
+                await second
+        self.assertIs(self.player.channel, self.channel)
+
+    async def test_queued_timeout_and_cancellation_preserve_active_move(self) -> None:
+        """Leaving the lock queue cannot clear the active move's acknowledgement."""
+        for cancel in (False, True):
+            with self.subTest(cancel=cancel):
+                self.setUp()
+                queued, release_request = Event(), Event()
+
+                async def send(
+                    *, channel: VoiceChannel, release: Event = release_request
+                ) -> None:
+                    self.sent.set()
+                    await release.wait()
+                    await self.voice_state_update(channel.id)
+
+                async def queued_move(signal: Event = queued) -> None:
+                    signal.set()
+                    await self.player.move_to(self.channel, timeout=0.01)
+
+                self.guild.change_voice_state.side_effect = send
+                async with asyncio.timeout(1):
+                    with patch.object(Node, "voice_update", AsyncMock()):
+                        active = asyncio.create_task(self.player.move_to(self.target))
+                        await self.sent.wait()
+                        waiting = asyncio.create_task(queued_move())
+                        await queued.wait()
+                        await self.voice_state_update(20)
+                        if cancel:
+                            waiting.cancel()
+                            with self.assertRaises(asyncio.CancelledError):
+                                await waiting
+                        else:
+                            with self.assertRaises(asyncio.TimeoutError):
+                                await waiting
+                        self.assertTrue(self.player._voice_state_update_event.is_set())
+                        self.guild.change_voice_state.assert_awaited_once()
+                        self.assertFalse(active.done())
+                        release_request.set()
+                        await active
+                        await self.player.move_to(self.channel, timeout=1)
+                self.assertIs(self.player.channel, self.channel)
+                self.assertFalse(self.player._move_lock.locked())
+
+    async def test_queued_move_rechecks_protocol_after_disconnect(self) -> None:
+        """A queued caller cannot revive a protocol removed by disconnect."""
+        queued = Event()
+
+        async def queued_move() -> None:
+            queued.set()
+            await self.player.move_to(self.channel)
+
+        async with asyncio.timeout(1):
+            with patch.object(Node, "voice_update", AsyncMock()):
+                first = asyncio.create_task(self.player.move_to(self.target))
+                await self.sent.wait()
+                second = asyncio.create_task(queued_move())
+                await queued.wait()
+                self.guild.voice_client = None
+                await self.voice_state_update(20)
+                await first
+                with self.assertRaises(PlayerNotConnected):
+                    await second
+        self.guild.change_voice_state.assert_awaited_once()
+
+    async def test_late_server_update_is_independent_of_move_return(self) -> None:
+        """Move confirmation can precede a new token at the same endpoint."""
+        server_started, release_server = Event(), Event()
+        self.player.node._players = {}
+
+        async def update(**kwargs: object) -> None:
+            data = cast("VoiceServerUpdatePayload", kwargs["data"])
+            if data["token"] == "new-token":  # noqa: S105 - synthetic fixture
+                server_started.set()
+                await release_server.wait()
+
+        async with asyncio.timeout(1):
+            with patch.object(Node, "voice_update", side_effect=update):
+                move = asyncio.create_task(self.player.move_to(self.target))
+                await self.sent.wait()
+                self.player._connected = False
+                await self.voice_state_update(20)
+                await move
+                self.assertFalse(self.player.connected)
+                # Same endpoint, new token; no new state event is needed here.
+                callback = asyncio.create_task(
+                    self.player.on_voice_server_update(
+                        {
+                            "guild_id": 1,
+                            "endpoint": "voice.example.com",
+                            "token": "new-token",
+                        }
+                    )
+                )
+                await server_started.wait()
+                self.assertTrue(move.done())
+                self.assertFalse(callback.done())
+                release_server.set()
+                await callback
+                state = self.player._server_state
+                if state is None:
+                    self.fail("The server callback did not retain the new credentials.")
+                self.assertEqual(state["token"], "new-token")
 
     async def test_timeout_does_not_break_next_move(self) -> None:
         """A late update from a timed out move cannot complete another target."""
