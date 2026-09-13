@@ -37,6 +37,7 @@ if TYPE_CHECKING:
         GuildVoiceStatePayload,
         VoiceServerUpdatePayload,
     )
+    from mafic.typings import Player as PlayerPayload
 
 
 class PlayerStateTests(TestCase):
@@ -750,8 +751,11 @@ class NodeTransferTests(IsolatedAsyncioTestCase):
         self.player._paused = False
         self.player._filters = OrderedDict()
 
-    def make_node(self, label: str) -> SimpleNamespace:
+    def make_node(
+        self, label: str, *, payload: PlayerPayload | None = None
+    ) -> SimpleNamespace:
         """Build a tiny node with an observable player mapping."""
+        state = payload if payload is not None else player_payload()
         players: dict[int, Player[Client]] = {}
 
         def add_player(guild_id: int, player: Player[Client]) -> None:
@@ -770,21 +774,20 @@ class NodeTransferTests(IsolatedAsyncioTestCase):
             remove_player=Mock(side_effect=remove_player),
             get_player=get_player,
             voice_update=AsyncMock(),
-            update=AsyncMock(return_value=player_payload()),
+            update=AsyncMock(return_value=state),
             destroy=AsyncMock(),
-            fetch_player=AsyncMock(return_value=player_payload()),
+            fetch_player=AsyncMock(return_value=state),
         )
 
     async def test_transfer_prepares_target_before_commit(self) -> None:
         """Target voice/state is prepared before ownership moves from A to B."""
-        old_node = self.make_node("A")
-        new_node = self.make_node("B")
+        server_state = player_payload("server")
+        old_node = self.make_node("A", payload=server_state)
+        new_node = self.make_node("B", payload=server_state)
         old_node._players[1] = self.player
         self.player._node = cast("Node[Client]", old_node)
-        started_position = self.player.position
 
         await self.player.transfer_to(cast("Node[Client]", new_node))
-        ended_position = self.player.position
 
         self.assertIs(self.player._node, new_node)
         self.assertNotIn(1, old_node._players)
@@ -801,12 +804,51 @@ class NodeTransferTests(IsolatedAsyncioTestCase):
             self.fail("Transfer did not restore playback state on the target.")
         update_kwargs = new_node.update.await_args.kwargs
         transferred = cast("Track", update_kwargs["track"])
-        self.assertIs(transferred, self.player._current)
-        self.assertEqual(transferred.user_data["correlation_id"], "transfer")
-        self.assertGreaterEqual(update_kwargs["position"], started_position)
-        self.assertLessEqual(update_kwargs["position"], ended_position)
+        self.assertEqual(transferred.user_data["correlation_id"], "server")
+        self.assertEqual(update_kwargs["position"], server_state["state"]["position"])
+        self.assertEqual(update_kwargs["volume"], server_state["volume"])
+        self.assertIs(update_kwargs["pause"], server_state["paused"])
+        restored_filter = cast("Filter", update_kwargs["filter"])
+        self.assertEqual(restored_filter.payload, server_state["filters"])
         old_node.destroy.assert_awaited_once_with(guild_id=1)
         new_node.destroy.assert_not_awaited()
+
+    async def test_transfer_restores_rest_snapshot_not_local_state(self) -> None:
+        """Transfer restoration uses the old node snapshot, not local mirrors."""
+        server_state = player_payload("server")
+        server_state["state"]["position"] = 25_000
+        server_state["volume"] = 37
+        server_state["paused"] = True
+        server_state["filters"] = Filter(volume=0.5).payload
+        self.player._current = Track.from_data_with_info(track_payload("local"))
+        self.player._position = 1_000
+        self.player._last_update = int(time() * 1_000)
+        self.player._paused = False
+        self.player._filters = OrderedDict({"LOCAL": Filter(volume=0.25)})
+        old_node = self.make_node("A", payload=server_state)
+        new_node = self.make_node("B", payload=server_state)
+        old_node._players[1] = self.player
+        self.player._node = cast("Node[Client]", old_node)
+
+        await self.player.transfer_to(cast("Node[Client]", new_node))
+
+        if new_node.update.await_args is None:
+            self.fail("Transfer did not restore playback state on the target.")
+        update_kwargs = new_node.update.await_args.kwargs
+        restored_track = cast("Track", update_kwargs["track"])
+        self.assertEqual(restored_track.user_data["correlation_id"], "server")
+        self.assertEqual(update_kwargs["position"], 25_000)
+        self.assertEqual(update_kwargs["volume"], 37)
+        self.assertTrue(update_kwargs["pause"])
+        restored_filter = cast("Filter", update_kwargs["filter"])
+        self.assertEqual(restored_filter.payload, server_state["filters"])
+        self.assertIsNotNone(self.player._current)
+        self.assertEqual(self.player._current.user_data["correlation_id"], "server")
+        self.assertEqual(self.player._position, 25_000)
+        self.assertEqual(self.player._volume, 37)
+        self.assertTrue(self.player._paused)
+        resume_filter = self.player._filters["RESUME"]
+        self.assertEqual(resume_filter.payload, server_state["filters"])
 
     async def test_actual_node_update_serializes_track_user_data(self) -> None:
         """The real Node.update payload carries Track.user_data for restore."""
@@ -907,7 +949,8 @@ class NodeTransferTests(IsolatedAsyncioTestCase):
                     }
 
                 if case == "channel":
-                    await self.player.transfer_to(cast("Node[Client]", new_node))
+                    with self.assertRaises(PlayerNotConnected):
+                        await self.player.transfer_to(cast("Node[Client]", new_node))
                 else:
                     with self.assertRaises(RuntimeError):
                         await self.player.transfer_to(cast("Node[Client]", new_node))

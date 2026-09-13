@@ -639,6 +639,14 @@ class Player(VoiceProtocol, Generic[ClientT]):
         node:
             The node to transfer to.
 
+        Raises
+        ------
+        PlayerNotConnected
+            If the player has no authoritative node or valid voice channel.
+        RuntimeError
+            If the player has no session/server state or the old node snapshot
+            is incomplete.
+
         Notes
         -----
         The target node is prepared before ownership is committed. If target
@@ -666,14 +674,20 @@ class Player(VoiceProtocol, Generic[ClientT]):
 
         channel = self.channel
         if not isinstance(channel, (VoiceChannel, StageChannel)):
-            msg = "Voice channel must be a VoiceChannel or StageChannel."
-            _log.warning(msg)
-            return
+            raise PlayerNotConnected
 
-        state = await old_node.fetch_player(self.guild.id)
-        if "volume" not in state:
+        snapshot = await old_node.fetch_player(self.guild.id)
+        required = ("track", "volume", "paused", "state", "filters")
+        if any(key not in snapshot for key in required):
             msg = "Cannot transfer player without playback state."
             raise RuntimeError(msg)
+
+        snapshot_track = (
+            Track.from_data_with_info(snapshot["track"])
+            if snapshot["track"] is not None
+            else None
+        )
+        snapshot_filter = Filter.from_payload(snapshot["filters"])
 
         # Prepare the target before committing ownership. A failed target
         # preparation must not destroy the old node's working player.
@@ -684,17 +698,13 @@ class Player(VoiceProtocol, Generic[ClientT]):
                 data=server_state,
                 channel_id=int(channel.id),
             )
-            await node.update(
+            target_state = await node.update(
                 guild_id=self._guild_id,
-                track=self._current,
-                position=self.position,
-                volume=state["volume"],
-                pause=self._paused,
-                filter=(
-                    reduce(lambda left, right: left | right, self._filters.values())
-                    if self._filters
-                    else Filter()
-                ),
+                track=snapshot_track,
+                position=snapshot["state"]["position"],
+                volume=snapshot["volume"],
+                pause=snapshot["paused"],
+                filter=snapshot_filter,
             )
         except Exception:
             try:
@@ -710,6 +720,24 @@ class Player(VoiceProtocol, Generic[ClientT]):
         node.add_player(self.guild.id, self)
         self._node = node
         old_node.remove_player(self.guild.id)
+
+        # Sync playback state from the actual target response. Voice credentials
+        # remain owned by on_voice_server_update; do not let a transient target
+        # response replace the authoritative Discord server state.
+        self._current = (
+            Track.from_data_with_info(target_state["track"])
+            if target_state["track"] is not None
+            else None
+        )
+        self._last_update = target_state["state"]["time"]
+        self._position = target_state["state"]["position"]
+        self._connected = target_state["state"]["connected"]
+        self._ping = target_state["state"]["ping"]
+        self._volume = target_state["volume"]
+        self._paused = target_state["paused"]
+        self._filters = OrderedDict(
+            {"RESUME": Filter.from_payload(target_state["filters"])}
+        )
 
         # The migration is committed; old cleanup is best-effort.
         try:
