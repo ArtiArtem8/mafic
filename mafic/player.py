@@ -182,7 +182,12 @@ class Player(VoiceProtocol, Generic[ClientT]):
 
     @property
     def node(self) -> Node[ClientT]:
-        """The node that the player is connected to."""
+        """The assigned node, or a usable node from the pool.
+
+        If no node is assigned, this selects a random available node without
+        assigning it to the player. Use :attr:`assigned_node` to inspect the
+        current assignment without selecting a fallback.
+        """
         if self._node is None:
             _log.warning(
                 "Unable to use best node, player not connected, finding random node.",
@@ -190,6 +195,15 @@ class Player(VoiceProtocol, Generic[ClientT]):
             )
             return NodePool[ClientT].get_random_node()
 
+        return self._node
+
+    @property
+    def assigned_node(self) -> Node[ClientT] | None:
+        """The node explicitly assigned to this player, if any.
+
+        Unlike :attr:`node`, this only reports the current assignment. It returns
+        ``None`` when unassigned and never selects or assigns a fallback node.
+        """
         return self._node
 
     @property

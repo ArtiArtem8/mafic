@@ -19,6 +19,7 @@ from mafic.filter import Filter
 from mafic.ip import FailingAddress
 from mafic.node import Node
 from mafic.player import Player
+from mafic.pool import NodePool
 from mafic.stats import CPUStats
 from mafic.track import Track
 from mafic.warnings import UnsupportedVersionWarning
@@ -38,6 +39,43 @@ if TYPE_CHECKING:
 
 class PlayerStateTests(TestCase):
     """Verify player reconstruction from the stable REST object."""
+
+    def test_unassigned_node_is_none_without_selecting_fallback(self) -> None:
+        """Inspecting an unassigned player never consults the pool."""
+        player: Player[Client] = cast("Player[Client]", object.__new__(Player))
+        player._node = None
+
+        with patch.object(NodePool, "get_random_node") as fallback:
+            self.assertIsNone(player.assigned_node)
+
+        fallback.assert_not_called()
+
+    def test_assigned_node_returns_current_assignment(self) -> None:
+        """Both node properties return the exact assigned node."""
+        player: Player[Client] = cast("Player[Client]", object.__new__(Player))
+        node = make_node(4)
+        player._node = node
+
+        with patch.object(NodePool, "get_random_node") as fallback:
+            self.assertIs(player.assigned_node, node)
+            self.assertIs(player.node, node)
+
+        fallback.assert_not_called()
+        with self.assertRaises(AttributeError):
+            setattr(player, "assigned_node", node)  # noqa: B010
+
+    def test_node_fallback_does_not_assign_node(self) -> None:
+        """The existing node fallback leaves the player unassigned."""
+        player: Player[Client] = cast("Player[Client]", object.__new__(Player))
+        player._node = None
+        player._guild_id = 1
+        node = make_node(4)
+
+        with patch.object(NodePool, "get_random_node", return_value=node) as fallback:
+            self.assertIs(player.node, node)
+            self.assertIsNone(player.assigned_node)
+
+        fallback.assert_called_once_with()
 
     def test_set_state_reads_player_state_and_track_metadata(self) -> None:
         """Sync/resume reconstruction keeps state and complete track metadata."""
