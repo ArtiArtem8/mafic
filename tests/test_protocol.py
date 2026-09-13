@@ -424,143 +424,6 @@ class VoiceStateTests(IsolatedAsyncioTestCase):
             ],
         )
 
-    async def test_transfer_waits_for_callback_and_routes_queued_update(self) -> None:
-        """Transfer and queued callback cannot PATCH different nodes concurrently."""
-        call_order: list[str] = []
-        old_calls: list[dict[str, object]] = []
-        new_calls: list[dict[str, object]] = []
-        first_entered, release_first, transfer_started, callback_started = (
-            Event(),
-            Event(),
-            Event(),
-            Event(),
-        )
-
-        async def old_voice_update(**kwargs: object) -> None:
-            call_order.append("old")
-            old_calls.append(kwargs)
-            if len(old_calls) == 1:
-                first_entered.set()
-                await release_first.wait()
-
-        async def new_voice_update(**kwargs: object) -> None:
-            call_order.append("new")
-            new_calls.append(kwargs)
-
-        async def fetch_player(_: int) -> object:
-            transfer_started.set()
-            return player_payload()
-
-        old_node = SimpleNamespace(
-            fetch_player=AsyncMock(side_effect=fetch_player),
-            remove_player=Mock(),
-            destroy=AsyncMock(),
-            add_player=Mock(),
-            voice_update=AsyncMock(side_effect=old_voice_update),
-        )
-        new_node = SimpleNamespace(
-            add_player=Mock(),
-            voice_update=AsyncMock(side_effect=new_voice_update),
-        )
-        self.player._node = cast("Node[Client]", old_node)
-        self.player._voice_update_lock = asyncio.Lock()
-        self.guild.get_channel.side_effect = {10: self.channel, 20: self.target}.get
-
-        async def queued_callback() -> None:
-            callback_started.set()
-            await self.player.on_voice_server_update(
-                {
-                    "guild_id": 1,
-                    "endpoint": "voice.example.com",
-                    "token": "new-token",
-                }
-            )
-
-        with patch.object(Player, "update", AsyncMock()):
-            blocked = asyncio.create_task(self.voice_state_update(20))
-            await first_entered.wait()
-            transfer = asyncio.create_task(
-                self.player.transfer_to(cast("Node[Client]", new_node))
-            )
-            await transfer_started.wait()
-            callback = asyncio.create_task(queued_callback())
-            await callback_started.wait()
-            release_first.set()
-            await asyncio.gather(blocked, transfer, callback)
-
-        self.assertIs(self.player._node, new_node)
-        self.assertEqual(call_order, ["old", "new", "new"])
-        self.assertEqual(len(old_calls), 1)
-        self.assertEqual(len(new_calls), 2)
-        old_data = cast("VoiceServerUpdatePayload", old_calls[0]["data"])
-        self.assertEqual(old_data["token"], "token")
-        new_data = [
-            cast("VoiceServerUpdatePayload", call["data"]) for call in new_calls
-        ]
-        # Transfer runs first with the credentials current at its turn; the
-        # queued server update then applies the new token to the same new node.
-        self.assertEqual([data["token"] for data in new_data], ["token", "new-token"])
-        for data in new_data:
-            self.assertEqual(data["endpoint"], "voice.example.com")
-        for call in new_calls:
-            self.assertEqual(call["channel_id"], 20)
-        server_state = self.player._server_state
-        if server_state is None:
-            self.fail("The queued server update did not retain its state.")
-        self.assertEqual(server_state["token"], "new-token")
-
-    async def test_server_update_migrates_player_to_selected_node(self) -> None:
-        """A changed endpoint cannot leave ownership split across two nodes."""
-        old_players: dict[int, object] = {1: self.player}
-        new_players: dict[int, object] = {}
-        old_node = SimpleNamespace(
-            label="old",
-            _players=old_players,
-            add_player=Mock(side_effect=old_players.__setitem__),
-            remove_player=Mock(side_effect=old_players.pop),
-            fetch_player=AsyncMock(return_value=player_payload()),
-            destroy=AsyncMock(),
-            voice_update=AsyncMock(),
-        )
-        new_node = SimpleNamespace(
-            label="new",
-            _players=new_players,
-            add_player=Mock(side_effect=new_players.__setitem__),
-            remove_player=Mock(side_effect=new_players.pop),
-            voice_update=AsyncMock(),
-        )
-        self.player._node = cast("Node[Client]", old_node)
-        self.player._current = Track.from_data_with_info(track_payload("migration"))
-        self.player._position = 250
-        update = AsyncMock()
-
-        data: VoiceServerUpdatePayload = {
-            "guild_id": 1,
-            "endpoint": "new.example.com",
-            "token": "new-token",
-        }
-        with (
-            patch("mafic.player.NodePool.get_node", return_value=new_node),
-            patch.object(Player, "update", update),
-        ):
-            await self.player.on_voice_server_update(data)
-
-        self.assertIs(self.player._node, new_node)
-        self.assertNotIn(1, old_players)
-        self.assertIs(new_players[1], self.player)
-        old_node.voice_update.assert_not_awaited()
-        new_node.voice_update.assert_awaited_once_with(
-            guild_id=1,
-            session_id="discord-session",
-            data=data,
-            channel_id=10,
-        )
-        if update.await_args is None:
-            self.fail("Migration did not restore playback state on the new node.")
-        self.assertIs(update.await_args.kwargs["track"], self.player._current)
-        self.assertEqual(update.await_args.kwargs["position"], self.player.position)
-        old_node.destroy.assert_awaited_once_with(guild_id=1)
-
     async def test_move_accepts_stage_channel(self) -> None:
         """The shared voice and stage channel surface works with every adapter."""
         self.target = Mock(spec=StageChannel, id=20, guild=self.guild)
@@ -863,47 +726,310 @@ class VoiceStateTests(IsolatedAsyncioTestCase):
         self.assertEqual(cast("FakeVoiceChannel", player.channel).id, 20)
 
 
-class TransferMetadataTests(IsolatedAsyncioTestCase):
-    """Verify node transfer preserves playback correlation metadata."""
+class NodeTransferTests(IsolatedAsyncioTestCase):
+    """Verify target-first node migration and its failure semantics."""
 
-    async def test_transfer_replays_current_track_with_user_data(self) -> None:
-        """The target node receives the complete current Track object."""
+    def setUp(self) -> None:
+        """Build an authoritative old-node player."""
+        self.guild = Mock(spec=Guild, id=1)
+        self.channel = Mock(spec=VoiceChannel, id=10, guild=self.guild)
+        self.guild.get_channel.side_effect = {10: self.channel}.get
+        self.client = cast("Client", Mock(spec=Client))
+        self.player = Player(self.client, cast("VoiceChannel", self.channel))
+        self.player._guild_id = 1
+        self.player._session_id = "discord-session"
+        self.player._server_state = {
+            "guild_id": 1,
+            "endpoint": "voice.example.com",
+            "token": "token",
+        }
+        self.player._connected = True
+        self.player._current = Track.from_data_with_info(track_payload("transfer"))
+        self.player._position = 250
+        self.player._last_update = int(time() * 1_000)
+        self.player._paused = False
+        self.player._filters = OrderedDict()
 
-        class FakeVoiceChannel:
-            id = 10
+    def make_node(self, label: str) -> SimpleNamespace:
+        """Build a tiny node with an observable player mapping."""
+        players: dict[int, Player[Client]] = {}
 
-        old_node = SimpleNamespace(
-            fetch_player=AsyncMock(return_value=player_payload()),
-            remove_player=Mock(),
+        def add_player(guild_id: int, player: Player[Client]) -> None:
+            players[guild_id] = player
+
+        def remove_player(guild_id: int) -> None:
+            players.pop(guild_id, None)
+
+        def get_player(guild_id: int) -> Player[Client] | None:
+            return players.get(guild_id)
+
+        return SimpleNamespace(
+            label=label,
+            _players=players,
+            add_player=Mock(side_effect=add_player),
+            remove_player=Mock(side_effect=remove_player),
+            get_player=get_player,
+            voice_update=AsyncMock(),
+            update=AsyncMock(return_value=player_payload()),
             destroy=AsyncMock(),
+            fetch_player=AsyncMock(return_value=player_payload()),
         )
-        new_node = SimpleNamespace(add_player=Mock(), voice_update=AsyncMock())
-        player: Player[Client] = cast("Player[Client]", object.__new__(Player))
-        player._voice_update_lock = asyncio.Lock()
-        player._node = cast("Node[Client]", old_node)
-        player.guild = cast("Guild", SimpleNamespace(id=1))
-        player.channel = cast("Connectable", FakeVoiceChannel())
-        player._guild_id = 1
-        player._session_id = "discord-session"
-        player._server_state = cast(
-            "VoiceServerUpdatePayload",
-            {"guild_id": 1, "endpoint": "voice.example.com", "token": "token"},
+
+    async def test_transfer_prepares_target_before_commit(self) -> None:
+        """Target voice/state is prepared before ownership moves from A to B."""
+        old_node = self.make_node("A")
+        new_node = self.make_node("B")
+        old_node._players[1] = self.player
+        self.player._node = cast("Node[Client]", old_node)
+        started_position = self.player.position
+
+        await self.player.transfer_to(cast("Node[Client]", new_node))
+        ended_position = self.player.position
+
+        self.assertIs(self.player._node, new_node)
+        self.assertNotIn(1, old_node._players)
+        self.assertIs(new_node._players[1], self.player)
+        old_node.voice_update.assert_not_awaited()
+        new_node.voice_update.assert_awaited_once_with(
+            guild_id=1,
+            session_id="discord-session",
+            data=self.player._server_state,
+            channel_id=10,
         )
-        player._current = Track.from_data_with_info(track_payload("transfer"))
-        player._position = 250
-        player._last_update = int(time() * 1_000)
-        player._connected = True
-        player._paused = False
-        player._filters = OrderedDict()
-        update = AsyncMock()
-
-        channel_patch = patch("mafic.player.VoiceChannel", FakeVoiceChannel)
-        update_patch = patch.object(Player, "update", update)
-        with channel_patch, update_patch:
-            await player.transfer_to(cast("Node[Client]", new_node))
-
-        if update.await_args is None:
-            self.fail("Transfer did not restore player state on the target node.")
-        transferred = update.await_args.kwargs["track"]
-        self.assertIsInstance(transferred, Track)
+        new_node.update.assert_awaited_once()
+        if new_node.update.await_args is None:
+            self.fail("Transfer did not restore playback state on the target.")
+        update_kwargs = new_node.update.await_args.kwargs
+        transferred = cast("Track", update_kwargs["track"])
+        self.assertIs(transferred, self.player._current)
         self.assertEqual(transferred.user_data["correlation_id"], "transfer")
+        self.assertGreaterEqual(update_kwargs["position"], started_position)
+        self.assertLessEqual(update_kwargs["position"], ended_position)
+        old_node.destroy.assert_awaited_once_with(guild_id=1)
+        new_node.destroy.assert_not_awaited()
+
+    async def test_actual_node_update_serializes_track_user_data(self) -> None:
+        """The real Node.update payload carries Track.user_data for restore."""
+        node = make_node(4)
+        track = Track.from_data_with_info(track_payload("transfer"))
+        request = AsyncMock(return_value=player_payload())
+
+        with patch.object(Node, "_Node__request", request):
+            await node.update(
+                guild_id=1,
+                track=track,
+                position=250,
+                volume=100,
+                pause=False,
+                filter=Filter(),
+            )
+
+        if request.await_args is None:
+            self.fail("Node.update did not send a REST request.")
+        payload = request.await_args.args[2]
+        self.assertEqual(payload["track"]["userData"]["correlation_id"], "transfer")
+        self.assertEqual(payload["position"], 250)
+
+    async def test_target_voice_update_failure_preserves_old_owner(self) -> None:
+        """A failed target voice PATCH cannot destroy or replace the old owner."""
+        old_node = self.make_node("A")
+        new_node = self.make_node("B")
+        old_node._players[1] = self.player
+        self.player._node = cast("Node[Client]", old_node)
+        new_node.voice_update.side_effect = RuntimeError("target voice failed")
+
+        with self.assertRaisesRegex(RuntimeError, "target voice failed"):
+            await self.player.transfer_to(cast("Node[Client]", new_node))
+
+        self.assertIs(self.player._node, old_node)
+        self.assertIs(old_node._players[1], self.player)
+        self.assertNotIn(1, new_node._players)
+        old_node.destroy.assert_not_awaited()
+        new_node.destroy.assert_awaited_once_with(guild_id=1)
+        new_node.update.assert_not_awaited()
+
+    async def test_target_restore_failure_preserves_old_owner(self) -> None:
+        """A failed target state restore cannot commit partial ownership."""
+        old_node = self.make_node("A")
+        new_node = self.make_node("B")
+        old_node._players[1] = self.player
+        self.player._node = cast("Node[Client]", old_node)
+        self.player._connected = False
+        new_node.update.side_effect = RuntimeError("target restore failed")
+
+        with self.assertRaisesRegex(RuntimeError, "target restore failed"):
+            await self.player.transfer_to(cast("Node[Client]", new_node))
+
+        self.assertIs(self.player._node, old_node)
+        self.assertIs(old_node._players[1], self.player)
+        self.assertNotIn(1, new_node._players)
+        self.assertFalse(self.player.connected)
+        old_node.destroy.assert_not_awaited()
+        new_node.destroy.assert_awaited_once_with(guild_id=1)
+
+    async def test_old_cleanup_failure_keeps_committed_target(self) -> None:
+        """Old-node cleanup is best-effort after ownership has committed."""
+        old_node = self.make_node("A")
+        new_node = self.make_node("B")
+        old_node._players[1] = self.player
+        self.player._node = cast("Node[Client]", old_node)
+        old_node.destroy.side_effect = RuntimeError("old cleanup failed")
+
+        await self.player.transfer_to(cast("Node[Client]", new_node))
+
+        self.assertIs(self.player._node, new_node)
+        self.assertNotIn(1, old_node._players)
+        self.assertIs(new_node._players[1], self.player)
+        new_node.update.assert_awaited_once()
+        old_node.destroy.assert_awaited_once_with(guild_id=1)
+
+    async def test_invalid_prerequisites_do_not_mutate_ownership(self) -> None:
+        """Missing or invalid voice state leaves the old owner untouched."""
+        cases = ("session", "server", "channel", "snapshot")
+        for case in cases:
+            with self.subTest(case=case):
+                self.setUp()
+                old_node = self.make_node("A")
+                new_node = self.make_node("B")
+                old_node._players[1] = self.player
+                self.player._node = cast("Node[Client]", old_node)
+                if case == "session":
+                    self.player._session_id = None
+                elif case == "server":
+                    self.player._server_state = None
+                elif case == "channel":
+                    self.player.channel = cast("Connectable", object())
+                else:
+                    old_node.fetch_player.return_value = {
+                        key: value
+                        for key, value in player_payload().items()
+                        if key != "volume"
+                    }
+
+                if case == "channel":
+                    await self.player.transfer_to(cast("Node[Client]", new_node))
+                else:
+                    with self.assertRaises(RuntimeError):
+                        await self.player.transfer_to(cast("Node[Client]", new_node))
+
+                self.assertIs(self.player._node, old_node)
+                self.assertIs(old_node._players[1], self.player)
+                self.assertNotIn(1, new_node._players)
+                old_node.destroy.assert_not_awaited()
+                new_node.voice_update.assert_not_awaited()
+                new_node.update.assert_not_awaited()
+
+    async def test_same_node_server_update_keeps_ownership(self) -> None:
+        """Endpoint changes that select the current node only refresh credentials."""
+        node = self.make_node("A")
+        node._players[1] = self.player
+        self.player._node = cast("Node[Client]", node)
+        data: VoiceServerUpdatePayload = {
+            "guild_id": 1,
+            "endpoint": "new.example.com",
+            "token": "new-token",
+        }
+
+        with patch("mafic.player.NodePool.get_node", return_value=node):
+            await self.player.on_voice_server_update(data)
+
+        self.assertIs(self.player._node, node)
+        self.assertIs(node._players[1], self.player)
+        node.voice_update.assert_awaited_once_with(
+            guild_id=1,
+            session_id="discord-session",
+            data=data,
+            channel_id=10,
+        )
+        node.update.assert_not_awaited()
+        node.destroy.assert_not_awaited()
+
+    async def test_server_migration_failure_keeps_new_credentials(self) -> None:
+        """A failed automatic migration keeps Discord state but old ownership."""
+        a_node = self.make_node("A")
+        b_node = self.make_node("B")
+        a_node._players[1] = self.player
+        self.player._node = cast("Node[Client]", a_node)
+        b_node.voice_update.side_effect = RuntimeError("server migration failed")
+        server_data: VoiceServerUpdatePayload = {
+            "guild_id": 1,
+            "endpoint": "new.example.com",
+            "token": "new-token",
+        }
+
+        with (
+            patch("mafic.player.NodePool.get_node", return_value=b_node),
+            self.assertRaisesRegex(RuntimeError, "server migration failed"),
+        ):
+            await self.player.on_voice_server_update(server_data)
+
+        self.assertIs(self.player._node, a_node)
+        self.assertIs(a_node._players[1], self.player)
+        self.assertNotIn(1, b_node._players)
+        self.assertEqual(self.player._server_state, server_data)
+        a_node.destroy.assert_not_awaited()
+        b_node.destroy.assert_awaited_once_with(guild_id=1)
+
+    async def test_transfer_rechecks_current_node_after_concurrent_migration(
+        self,
+    ) -> None:
+        """A queued public transfer fetches from the actual authoritative node."""
+        a_node = self.make_node("A")
+        b_node = self.make_node("B")
+        c_node = self.make_node("C")
+        a_node._players[1] = self.player
+        self.player._node = cast("Node[Client]", a_node)
+
+        server_voice_started, release_server = Event(), Event()
+
+        async def block_target_voice(**_: object) -> None:
+            server_voice_started.set()
+            await release_server.wait()
+
+        b_node.voice_update.side_effect = block_target_voice
+        server_data: VoiceServerUpdatePayload = {
+            "guild_id": 1,
+            "endpoint": "new.example.com",
+            "token": "new-token",
+        }
+
+        with patch("mafic.player.NodePool.get_node", return_value=b_node):
+            server_task = asyncio.create_task(
+                self.player.on_voice_server_update(server_data)
+            )
+            await server_voice_started.wait()
+
+            public_started = Event()
+
+            async def public_transfer() -> None:
+                public_started.set()
+                await self.player.transfer_to(cast("Node[Client]", c_node))
+
+            public_task = asyncio.create_task(public_transfer())
+            await public_started.wait()
+
+            release_server.set()
+            await asyncio.gather(server_task, public_task)
+
+        self.assertIs(self.player._node, c_node)
+        self.assertNotIn(1, a_node._players)
+        self.assertNotIn(1, b_node._players)
+        self.assertIs(c_node._players[1], self.player)
+        self.assertEqual(a_node.fetch_player.await_count, 1)
+        self.assertEqual(b_node.fetch_player.await_count, 1)
+        self.assertEqual(c_node.fetch_player.await_count, 0)
+        b_node.voice_update.assert_awaited_once_with(
+            guild_id=1,
+            session_id="discord-session",
+            data=server_data,
+            channel_id=10,
+        )
+        c_node.voice_update.assert_awaited_once_with(
+            guild_id=1,
+            session_id="discord-session",
+            data=server_data,
+            channel_id=10,
+        )
+        b_node.destroy.assert_awaited_once_with(guild_id=1)
+        c_node.destroy.assert_not_awaited()
+        self.assertEqual(self.player._server_state, server_data)

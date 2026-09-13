@@ -439,24 +439,19 @@ class Player(VoiceProtocol, Generic[ClientT]):
             else:
                 selected_node = current_node
 
+            # Discord owns these credentials even if node migration later fails.
+            self._guild_id = int(data["guild_id"])
+            self._endpoint = data["endpoint"]
+            self._server_state = data
+
             if current_node is None:
                 self._node = selected_node
-                self._guild_id = int(data["guild_id"])
-                self._endpoint = data["endpoint"]
-                self._server_state = data
                 self._node.add_player(self._guild_id, self)
                 await self._dispatch_player_update_unlocked()
             elif selected_node is not current_node:
-                state = await current_node.fetch_player(self.guild.id)
-                self._guild_id = int(data["guild_id"])
-                self._endpoint = data["endpoint"]
-                self._server_state = data
-                await self._transfer_to_unlocked(selected_node, state)
+                await self._transfer_to_unlocked(selected_node)
             else:
                 current_node.add_player(self._guild_id, self)
-                self._guild_id = int(data["guild_id"])
-                self._endpoint = data["endpoint"]
-                self._server_state = data
                 await self._dispatch_player_update_unlocked()
 
         self._voice_server_update_event.set()
@@ -643,23 +638,18 @@ class Player(VoiceProtocol, Generic[ClientT]):
         ----------
         node:
             The node to transfer to.
+
+        Notes
+        -----
+        The target node is prepared before ownership is committed. If target
+        preparation fails, the old node remains authoritative and its Lavalink
+        player is preserved. After a successful commit, failure to destroy the
+        old Lavalink player is logged and does not roll back the transfer.
         """
-        if self._node is None:
-            raise PlayerNotConnected
-
-        if self._node == node:
-            return
-
-        state = await self._node.fetch_player(self.guild.id)
-
         async with self._voice_update_lock:
-            await self._transfer_to_unlocked(node, state)
+            await self._transfer_to_unlocked(node)
 
-    async def _transfer_to_unlocked(
-        self,
-        node: Node[ClientT],
-        state: PlayerPayload,
-    ) -> None:
+    async def _transfer_to_unlocked(self, node: Node[ClientT]) -> None:
         """Transfer ownership while holding `_voice_update_lock`."""
         old_node = self._node
         if old_node is None:
@@ -667,12 +657,6 @@ class Player(VoiceProtocol, Generic[ClientT]):
 
         if old_node == node:
             return
-
-        # Remove from the current node, but no need to destroy.
-        old_node.remove_player(self.guild.id)
-
-        self._node = node
-        self._node.add_player(self.guild.id, self)
 
         session_id = self._session_id
         server_state = self._server_state
@@ -686,31 +670,55 @@ class Player(VoiceProtocol, Generic[ClientT]):
             _log.warning(msg)
             return
 
-        # We need to update the voice server as the endpoint may have changed.
-        await self._node.voice_update(
-            guild_id=self._guild_id,
-            session_id=session_id,
-            data=server_state,
-            channel_id=int(channel.id),
-        )
+        state = await old_node.fetch_player(self.guild.id)
+        if "volume" not in state:
+            msg = "Cannot transfer player without playback state."
+            raise RuntimeError(msg)
 
-        # Needed so .update does not fail.
-        self._connected = True
-        # Update player with all other state.
-        # Position, filters, track, etc.
-        await self.update(
-            track=self._current,
-            position=self.position,
-            volume=state["volume"],
-            pause=self._paused,
-            filter=(
-                reduce(lambda left, right: left | right, self._filters.values())
-                if self._filters
-                else Filter()
-            ),
-        )
+        # Prepare the target before committing ownership. A failed target
+        # preparation must not destroy the old node's working player.
+        try:
+            await node.voice_update(
+                guild_id=self._guild_id,
+                session_id=session_id,
+                data=server_state,
+                channel_id=int(channel.id),
+            )
+            await node.update(
+                guild_id=self._guild_id,
+                track=self._current,
+                position=self.position,
+                volume=state["volume"],
+                pause=self._paused,
+                filter=(
+                    reduce(lambda left, right: left | right, self._filters.values())
+                    if self._filters
+                    else Filter()
+                ),
+            )
+        except Exception:
+            try:
+                await node.destroy(guild_id=self.guild.id)
+            except Exception:  # noqa: BLE001 - best-effort partial cleanup
+                _log.exception(
+                    "Failed to clean up partial target node player.",
+                    extra={"guild": self.guild.id},
+                )
+            raise
 
-        await old_node.destroy(guild_id=self.guild.id)
+        # Commit ownership only after the target is fully prepared.
+        node.add_player(self.guild.id, self)
+        self._node = node
+        old_node.remove_player(self.guild.id)
+
+        # The migration is committed; old cleanup is best-effort.
+        try:
+            await old_node.destroy(guild_id=self.guild.id)
+        except Exception:  # noqa: BLE001 - committed migration, cleanup only
+            _log.exception(
+                "Failed to destroy old node player after transfer.",
+                extra={"guild": self.guild.id},
+            )
 
     async def destroy(self) -> None:  # noqa: D102
         warnings.warn(
