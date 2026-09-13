@@ -380,44 +380,125 @@ class VoiceStateTests(IsolatedAsyncioTestCase):
                 await callback
                 await move
 
-    async def test_voice_updates_are_serialized(self) -> None:
-        """State/server callbacks cannot issue overlapping voice updates."""
-        first_entered, release_first = Event(), Event()
-        sent_tokens: list[str] = []
+    async def test_state_update_serializes_before_server_update(self) -> None:
+        """A queued server update cannot overlap a blocked state update."""
+        first_entered, release_first, server_started = Event(), Event(), Event()
+        updates: list[tuple[str, str | None, object]] = []
 
         async def voice_update(**kwargs: object) -> None:
             data = cast("VoiceServerUpdatePayload", kwargs["data"])
-            sent_tokens.append(data["token"])
-            if len(sent_tokens) == 1:
+            updates.append((data["token"], data["endpoint"], kwargs["channel_id"]))
+            if len(updates) == 1:
                 first_entered.set()
                 await release_first.wait()
 
-        async def first_server_update() -> None:
-            await self.player.on_voice_server_update(
-                {"guild_id": 1, "endpoint": "voice.example.com", "token": "first-token"}
-            )
-
-        async def second_server_update() -> None:
+        async def server_update() -> None:
+            server_started.set()
             await self.player.on_voice_server_update(
                 {
                     "guild_id": 1,
-                    "endpoint": "voice.example.com",
-                    "token": "second-token",
+                    "endpoint": "new.example.com",
+                    "token": "new-token",
                 }
             )
 
         self.player.node._players = {}
-        with patch.object(Node, "voice_update", side_effect=voice_update):
-            first = asyncio.create_task(first_server_update())
+        with (
+            patch.object(Node, "voice_update", side_effect=voice_update),
+            patch("mafic.player.NodePool.get_node", return_value=self.player.node),
+        ):
+            state = asyncio.create_task(self.voice_state_update(20))
             await first_entered.wait()
-            second = asyncio.create_task(second_server_update())
-            await asyncio.sleep(0)
-            self.assertEqual(sent_tokens, ["first-token"])
-            self.assertFalse(second.done())
+            server = asyncio.create_task(server_update())
+            await server_started.wait()
+            self.assertEqual(len(updates), 1)
+            self.assertFalse(server.done())
             release_first.set()
-            await asyncio.gather(first, second)
+            await asyncio.gather(state, server)
 
-        self.assertEqual(sent_tokens, ["first-token", "second-token"])
+        self.assertEqual(
+            updates,
+            [
+                ("token", "voice.example.com", 20),
+                ("new-token", "new.example.com", 20),
+            ],
+        )
+
+    async def test_transfer_waits_for_callback_and_routes_queued_update(self) -> None:
+        """Transfer and queued callback cannot PATCH different nodes concurrently."""
+        call_order: list[str] = []
+        old_calls: list[dict[str, object]] = []
+        new_calls: list[dict[str, object]] = []
+        first_entered, release_first, transfer_started, callback_started = (
+            Event(),
+            Event(),
+            Event(),
+            Event(),
+        )
+
+        async def old_voice_update(**kwargs: object) -> None:
+            call_order.append("old")
+            old_calls.append(kwargs)
+            if len(old_calls) == 1:
+                first_entered.set()
+                await release_first.wait()
+
+        async def new_voice_update(**kwargs: object) -> None:
+            call_order.append("new")
+            new_calls.append(kwargs)
+
+        async def fetch_player(_: int) -> object:
+            transfer_started.set()
+            return player_payload()
+
+        old_node = SimpleNamespace(
+            fetch_player=AsyncMock(side_effect=fetch_player),
+            remove_player=Mock(),
+            destroy=AsyncMock(),
+            add_player=Mock(),
+            voice_update=AsyncMock(side_effect=old_voice_update),
+        )
+        new_node = SimpleNamespace(
+            add_player=Mock(),
+            voice_update=AsyncMock(side_effect=new_voice_update),
+        )
+        self.player._node = cast("Node[Client]", old_node)
+        self.player._voice_update_lock = asyncio.Lock()
+        self.guild.get_channel.side_effect = {10: self.channel, 20: self.target}.get
+
+        async def queued_callback() -> None:
+            callback_started.set()
+            await self.player.on_voice_server_update(
+                {
+                    "guild_id": 1,
+                    "endpoint": "voice.example.com",
+                    "token": "new-token",
+                }
+            )
+
+        with patch.object(Player, "update", AsyncMock()):
+            blocked = asyncio.create_task(self.voice_state_update(20))
+            await first_entered.wait()
+            transfer = asyncio.create_task(
+                self.player.transfer_to(cast("Node[Client]", new_node))
+            )
+            await transfer_started.wait()
+            callback = asyncio.create_task(queued_callback())
+            await callback_started.wait()
+            release_first.set()
+            await asyncio.gather(blocked, transfer, callback)
+
+        self.assertIs(self.player._node, new_node)
+        self.assertEqual(call_order, ["old", "new", "new"])
+        self.assertEqual(len(old_calls), 1)
+        self.assertEqual(len(new_calls), 2)
+        old_data = cast("VoiceServerUpdatePayload", old_calls[0]["data"])
+        self.assertEqual(old_data["token"], "token")
+        for call in new_calls:
+            data = cast("VoiceServerUpdatePayload", call["data"])
+            self.assertEqual(data["token"], "new-token")
+            self.assertEqual(data["endpoint"], "voice.example.com")
+            self.assertEqual(call["channel_id"], 20)
 
     async def test_move_accepts_stage_channel(self) -> None:
         """The shared voice and stage channel surface works with every adapter."""
@@ -737,6 +818,7 @@ class TransferMetadataTests(IsolatedAsyncioTestCase):
         )
         new_node = SimpleNamespace(add_player=Mock(), voice_update=AsyncMock())
         player: Player[Client] = cast("Player[Client]", object.__new__(Player))
+        player._voice_update_lock = asyncio.Lock()
         player._node = cast("Node[Client]", old_node)
         player.guild = cast("Guild", SimpleNamespace(id=1))
         player.channel = cast("Connectable", FakeVoiceChannel())

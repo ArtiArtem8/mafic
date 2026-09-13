@@ -246,27 +246,27 @@ class Player(VoiceProtocol, Generic[ClientT]):
 
     async def _dispatch_player_update(self) -> None:
         """Dispatch a player update to the node."""
-        node = self._node
-        if node is None:
-            _log.debug("Recieved voice update before node was found.")
-            return
-
-        session_id = self._session_id
-        if session_id is None:
-            _log.debug("Receieved player update before session ID was set.")
-            return
-
-        server_state = self._server_state
-        if server_state is None:
-            _log.debug("Receieved player update before server state was found")
-            return
-
-        channel = self.channel
-        if not isinstance(channel, (VoiceChannel, StageChannel)):
-            _log.debug("Received player update before channel was set.")
-            return
-
         async with self._voice_update_lock:
+            node = self._node
+            if node is None:
+                _log.debug("Recieved voice update before node was found.")
+                return
+
+            session_id = self._session_id
+            if session_id is None:
+                _log.debug("Receieved player update before session ID was set.")
+                return
+
+            server_state = self._server_state
+            if server_state is None:
+                _log.debug("Receieved player update before server state was found")
+                return
+
+            channel = self.channel
+            if not isinstance(channel, (VoiceChannel, StageChannel)):
+                _log.debug("Received player update before channel was set.")
+                return
+
             await node.voice_update(
                 guild_id=self._guild_id,
                 session_id=session_id,
@@ -633,29 +633,33 @@ class Player(VoiceProtocol, Generic[ClientT]):
 
         state = await self._node.fetch_player(self.guild.id)
 
-        # Remove from the current node, but no need to destroy.
-        self._node.remove_player(self.guild.id)
+        async with self._voice_update_lock:
+            # Remove from the current node, but no need to destroy.
+            old_node = self._node
+            old_node.remove_player(self.guild.id)
 
-        old_node = self._node
-        self._node = node
-        self._node.add_player(self.guild.id, self)
+            self._node = node
+            self._node.add_player(self.guild.id, self)
 
-        if self._session_id is None or self._server_state is None:
-            msg = "Cannot transfer player with session data."
-            raise RuntimeError(msg)
+            session_id = self._session_id
+            server_state = self._server_state
+            if session_id is None or server_state is None:
+                msg = "Cannot transfer player with session data."
+                raise RuntimeError(msg)
 
-        if not isinstance(self.channel, (VoiceChannel, StageChannel)):
-            msg = "Voice channel must be a VoiceChannel or StageChannel."
-            _log.warning(msg)
-            return
+            channel = self.channel
+            if not isinstance(channel, (VoiceChannel, StageChannel)):
+                msg = "Voice channel must be a VoiceChannel or StageChannel."
+                _log.warning(msg)
+                return
 
-        # We need to update the voice server as the endpoint may have changed.
-        await self._node.voice_update(
-            guild_id=self._guild_id,
-            session_id=self._session_id,
-            data=self._server_state,
-            channel_id=int(self.channel.id),
-        )
+            # We need to update the voice server as the endpoint may have changed.
+            await self._node.voice_update(
+                guild_id=self._guild_id,
+                session_id=session_id,
+                data=server_state,
+                channel_id=int(channel.id),
+            )
 
         # Needed so .update does not fail.
         self._connected = True
