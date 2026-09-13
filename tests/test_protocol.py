@@ -320,8 +320,8 @@ class VoiceStateTests(IsolatedAsyncioTestCase):
         await self.player.on_voice_state_update(cast("GuildVoiceStatePayload", payload))
 
     async def test_move_waits_for_callback_and_sends_new_channel_id(self) -> None:
-        """A move needs only voice state, even with an unchanged session ID."""
-        # No new server or Lavalink-ready event will arrive for this move.
+        """A state-only fixture uses cached server data and an unchanged session."""
+        # This fixture emits no server or ready event; live Discord may emit both.
         self.player._voice_server_update_event.clear()
         self.player._node_player_ready_event.clear()
         request = AsyncMock(return_value=player_payload())
