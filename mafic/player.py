@@ -247,32 +247,36 @@ class Player(VoiceProtocol, Generic[ClientT]):
     async def _dispatch_player_update(self) -> None:
         """Dispatch a player update to the node."""
         async with self._voice_update_lock:
-            node = self._node
-            if node is None:
-                _log.debug("Recieved voice update before node was found.")
-                return
+            await self._dispatch_player_update_unlocked()
 
-            session_id = self._session_id
-            if session_id is None:
-                _log.debug("Receieved player update before session ID was set.")
-                return
+    async def _dispatch_player_update_unlocked(self) -> None:
+        """Dispatch using current state while holding `_voice_update_lock`."""
+        node = self._node
+        if node is None:
+            _log.debug("Recieved voice update before node was found.")
+            return
 
-            server_state = self._server_state
-            if server_state is None:
-                _log.debug("Receieved player update before server state was found")
-                return
+        session_id = self._session_id
+        if session_id is None:
+            _log.debug("Receieved player update before session ID was set.")
+            return
 
-            channel = self.channel
-            if not isinstance(channel, (VoiceChannel, StageChannel)):
-                _log.debug("Received player update before channel was set.")
-                return
+        server_state = self._server_state
+        if server_state is None:
+            _log.debug("Receieved player update before server state was found")
+            return
 
-            await node.voice_update(
-                guild_id=self._guild_id,
-                session_id=session_id,
-                data=server_state,
-                channel_id=int(channel.id),
-            )
+        channel = self.channel
+        if not isinstance(channel, (VoiceChannel, StageChannel)):
+            _log.debug("Received player update before channel was set.")
+            return
+
+        await node.voice_update(
+            guild_id=self._guild_id,
+            session_id=session_id,
+            data=server_state,
+            channel_id=int(channel.id),
+        )
 
     def dispatch_event(self, data: EventPayload) -> None:
         """Dispatch an event to the player.
@@ -414,30 +418,46 @@ class Player(VoiceProtocol, Generic[ClientT]):
         data:
             The voice server update payload.
         """
-        # Fetch the best node as we either don't know the best one yet.
-        # Or the node we were using was not the best one (endpoint optimisation).
-        if (
-            self._node is None
-            or self._server_state is None
-            or self._server_state["endpoint"] != data["endpoint"]
-        ):
-            _log.debug("Getting best node for player", extra={"guild": self._guild_id})
-            self._node = NodePool[ClientT].get_node(
-                guild_id=data["guild_id"], endpoint=data["endpoint"]
-            )
-            _log.debug(
-                "Got best node for player: %s",
-                self._node.label,
-                extra={"guild": self._guild_id},
-            )
+        async with self._voice_update_lock:
+            current_node = self._node
+            if (
+                current_node is None
+                or self._server_state is None
+                or self._server_state["endpoint"] != data["endpoint"]
+            ):
+                _log.debug(
+                    "Getting best node for player", extra={"guild": self._guild_id}
+                )
+                selected_node = NodePool[ClientT].get_node(
+                    guild_id=data["guild_id"], endpoint=data["endpoint"]
+                )
+                _log.debug(
+                    "Got best node for player: %s",
+                    selected_node.label,
+                    extra={"guild": self._guild_id},
+                )
+            else:
+                selected_node = current_node
 
-        self._node.add_player(self._guild_id, self)
-
-        self._guild_id = int(data["guild_id"])
-        self._endpoint = data["endpoint"]
-        self._server_state = data
-
-        await self._dispatch_player_update()
+            if current_node is None:
+                self._node = selected_node
+                self._guild_id = int(data["guild_id"])
+                self._endpoint = data["endpoint"]
+                self._server_state = data
+                self._node.add_player(self._guild_id, self)
+                await self._dispatch_player_update_unlocked()
+            elif selected_node is not current_node:
+                state = await current_node.fetch_player(self.guild.id)
+                self._guild_id = int(data["guild_id"])
+                self._endpoint = data["endpoint"]
+                self._server_state = data
+                await self._transfer_to_unlocked(selected_node, state)
+            else:
+                current_node.add_player(self._guild_id, self)
+                self._guild_id = int(data["guild_id"])
+                self._endpoint = data["endpoint"]
+                self._server_state = data
+                await self._dispatch_player_update_unlocked()
 
         self._voice_server_update_event.set()
 
@@ -530,9 +550,8 @@ class Player(VoiceProtocol, Generic[ClientT]):
         request. It does not guarantee a ready Lavalink voice connection: a later
         voice server update can replace the credentials and trigger reconnection,
         even after Lavalink briefly reported connected. Server updates are handled
-        independently and are not required to complete every move. Voice updates
-        to Lavalink are serialized per player, so overlapping state/server
-        callbacks preserve their callback order.
+        independently and are not required to complete every move. Lavalink
+        voice updates are serialized per player.
 
         A temporary Lavalink disconnect does not prevent moving an active Discord
         voice protocol. Disconnect is independent of this queue; an interrupted
@@ -634,32 +653,46 @@ class Player(VoiceProtocol, Generic[ClientT]):
         state = await self._node.fetch_player(self.guild.id)
 
         async with self._voice_update_lock:
-            # Remove from the current node, but no need to destroy.
-            old_node = self._node
-            old_node.remove_player(self.guild.id)
+            await self._transfer_to_unlocked(node, state)
 
-            self._node = node
-            self._node.add_player(self.guild.id, self)
+    async def _transfer_to_unlocked(
+        self,
+        node: Node[ClientT],
+        state: PlayerPayload,
+    ) -> None:
+        """Transfer ownership while holding `_voice_update_lock`."""
+        old_node = self._node
+        if old_node is None:
+            raise PlayerNotConnected
 
-            session_id = self._session_id
-            server_state = self._server_state
-            if session_id is None or server_state is None:
-                msg = "Cannot transfer player with session data."
-                raise RuntimeError(msg)
+        if old_node == node:
+            return
 
-            channel = self.channel
-            if not isinstance(channel, (VoiceChannel, StageChannel)):
-                msg = "Voice channel must be a VoiceChannel or StageChannel."
-                _log.warning(msg)
-                return
+        # Remove from the current node, but no need to destroy.
+        old_node.remove_player(self.guild.id)
 
-            # We need to update the voice server as the endpoint may have changed.
-            await self._node.voice_update(
-                guild_id=self._guild_id,
-                session_id=session_id,
-                data=server_state,
-                channel_id=int(channel.id),
-            )
+        self._node = node
+        self._node.add_player(self.guild.id, self)
+
+        session_id = self._session_id
+        server_state = self._server_state
+        if session_id is None or server_state is None:
+            msg = "Cannot transfer player with session data."
+            raise RuntimeError(msg)
+
+        channel = self.channel
+        if not isinstance(channel, (VoiceChannel, StageChannel)):
+            msg = "Voice channel must be a VoiceChannel or StageChannel."
+            _log.warning(msg)
+            return
+
+        # We need to update the voice server as the endpoint may have changed.
+        await self._node.voice_update(
+            guild_id=self._guild_id,
+            session_id=session_id,
+            data=server_state,
+            channel_id=int(channel.id),
+        )
 
         # Needed so .update does not fail.
         self._connected = True

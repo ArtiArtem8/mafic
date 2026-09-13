@@ -494,11 +494,72 @@ class VoiceStateTests(IsolatedAsyncioTestCase):
         self.assertEqual(len(new_calls), 2)
         old_data = cast("VoiceServerUpdatePayload", old_calls[0]["data"])
         self.assertEqual(old_data["token"], "token")
-        for call in new_calls:
-            data = cast("VoiceServerUpdatePayload", call["data"])
-            self.assertEqual(data["token"], "new-token")
+        new_data = [
+            cast("VoiceServerUpdatePayload", call["data"]) for call in new_calls
+        ]
+        # Transfer runs first with the credentials current at its turn; the
+        # queued server update then applies the new token to the same new node.
+        self.assertEqual([data["token"] for data in new_data], ["token", "new-token"])
+        for data in new_data:
             self.assertEqual(data["endpoint"], "voice.example.com")
+        for call in new_calls:
             self.assertEqual(call["channel_id"], 20)
+        server_state = self.player._server_state
+        if server_state is None:
+            self.fail("The queued server update did not retain its state.")
+        self.assertEqual(server_state["token"], "new-token")
+
+    async def test_server_update_migrates_player_to_selected_node(self) -> None:
+        """A changed endpoint cannot leave ownership split across two nodes."""
+        old_players: dict[int, object] = {1: self.player}
+        new_players: dict[int, object] = {}
+        old_node = SimpleNamespace(
+            label="old",
+            _players=old_players,
+            add_player=Mock(side_effect=old_players.__setitem__),
+            remove_player=Mock(side_effect=old_players.pop),
+            fetch_player=AsyncMock(return_value=player_payload()),
+            destroy=AsyncMock(),
+            voice_update=AsyncMock(),
+        )
+        new_node = SimpleNamespace(
+            label="new",
+            _players=new_players,
+            add_player=Mock(side_effect=new_players.__setitem__),
+            remove_player=Mock(side_effect=new_players.pop),
+            voice_update=AsyncMock(),
+        )
+        self.player._node = cast("Node[Client]", old_node)
+        self.player._current = Track.from_data_with_info(track_payload("migration"))
+        self.player._position = 250
+        update = AsyncMock()
+
+        data: VoiceServerUpdatePayload = {
+            "guild_id": 1,
+            "endpoint": "new.example.com",
+            "token": "new-token",
+        }
+        with (
+            patch("mafic.player.NodePool.get_node", return_value=new_node),
+            patch.object(Player, "update", update),
+        ):
+            await self.player.on_voice_server_update(data)
+
+        self.assertIs(self.player._node, new_node)
+        self.assertNotIn(1, old_players)
+        self.assertIs(new_players[1], self.player)
+        old_node.voice_update.assert_not_awaited()
+        new_node.voice_update.assert_awaited_once_with(
+            guild_id=1,
+            session_id="discord-session",
+            data=data,
+            channel_id=10,
+        )
+        if update.await_args is None:
+            self.fail("Migration did not restore playback state on the new node.")
+        self.assertIs(update.await_args.kwargs["track"], self.player._current)
+        self.assertEqual(update.await_args.kwargs["position"], self.player.position)
+        old_node.destroy.assert_awaited_once_with(guild_id=1)
 
     async def test_move_accepts_stage_channel(self) -> None:
         """The shared voice and stage channel surface works with every adapter."""
