@@ -4,9 +4,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import warnings
 from asyncio import Event
 from collections import OrderedDict
+from importlib import import_module
 from time import time
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
@@ -15,6 +17,8 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from yarl import URL
 
+from mafic.__libraries import Client, Guild, StageChannel, VoiceChannel, library
+from mafic.errors import PlayerNotConnected
 from mafic.filter import Filter
 from mafic.ip import FailingAddress
 from mafic.node import Node
@@ -29,9 +33,7 @@ from .test_track import track_payload
 
 if TYPE_CHECKING:
     from mafic.__libraries import (
-        Client,
         Connectable,
-        Guild,
         GuildVoiceStatePayload,
         VoiceServerUpdatePayload,
     )
@@ -271,6 +273,201 @@ class NodeProtocolTests(IsolatedAsyncioTestCase):
 
 class VoiceStateTests(IsolatedAsyncioTestCase):
     """Verify Discord voice state changes reach Lavalink."""
+
+    def setUp(self) -> None:
+        """Build a connected player using the selected adapter's channel types."""
+        self.guild = Mock(spec=Guild, id=1)
+        self.channel = Mock(spec=VoiceChannel, id=10, guild=self.guild)
+        self.target = Mock(spec=VoiceChannel, id=20, guild=self.guild)
+        self.guild.get_channel.side_effect = {
+            10: self.channel,
+            20: self.target,
+        }.get
+        self.sent = Event()
+
+        async def send(*, channel: VoiceChannel | StageChannel) -> None:
+            self.assertEqual(channel.guild.id, self.guild.id)
+            self.sent.set()
+
+        self.guild.change_voice_state = AsyncMock(side_effect=send)
+        self.player = Player(
+            cast("Client", Mock(spec=Client)),
+            cast("VoiceChannel", self.channel),
+            node=make_node(4),
+        )
+        self.player._connected = True
+        self.player._session_id = "discord-session"
+        self.player._server_state = {
+            "guild_id": 1,
+            "endpoint": "voice.example.com",
+            "token": "token",
+        }
+        self.player._voice_state_update_event.set()
+        self.player._voice_server_update_event.set()
+        self.player._node_player_ready_event.set()
+
+    async def voice_state_update(self, channel_id: int) -> None:
+        """Deliver the adapter's payload through the normal Mafic callback."""
+        payload: object = {
+            "session_id": "discord-session",
+            "guild_id": "1",
+            "channel_id": str(channel_id),
+        }
+        if library == "py-cord":
+            # Pycord 2.8 dispatches payload objects with mapping compatibility.
+            raw_models = import_module("discord.raw_models")
+            payload = raw_models.RawVoiceStateUpdateEvent(data=payload, state=Mock())
+        await self.player.on_voice_state_update(cast("GuildVoiceStatePayload", payload))
+
+    async def test_move_waits_for_callback_and_sends_new_channel_id(self) -> None:
+        """A move needs only voice state, even with an unchanged session ID."""
+        # No new server or Lavalink-ready event will arrive for this move.
+        self.player._voice_server_update_event.clear()
+        self.player._node_player_ready_event.clear()
+        request = AsyncMock(return_value=player_payload())
+        async with asyncio.timeout(1):
+            with patch.object(Node, "_Node__request", request):
+                move = asyncio.create_task(self.player.move_to(self.target))
+                await self.sent.wait()
+                self.assertFalse(move.done())
+                self.assertIs(self.player.channel, self.channel)
+                request.assert_not_awaited()
+                await self.voice_state_update(20)
+                await move
+
+        self.guild.change_voice_state.assert_awaited_once_with(channel=self.target)
+        self.assertIs(self.player.channel, self.target)
+        request.assert_awaited_once_with(
+            "PATCH",
+            "sessions/lavalink-session/players/1",
+            {
+                "voice": {
+                    "sessionId": "discord-session",
+                    "endpoint": "voice.example.com",
+                    "token": "token",
+                    "channelId": "20",
+                }
+            },
+        )
+
+    async def test_move_to_current_channel_is_noop(self) -> None:
+        """The current channel is recognized by ID without touching events."""
+        await self.player.move_to(Mock(spec=VoiceChannel, id=10, guild=self.guild))
+
+        self.guild.change_voice_state.assert_not_awaited()
+        self.assertTrue(self.player._voice_state_update_event.is_set())
+        self.assertTrue(self.player._voice_server_update_event.is_set())
+        self.assertTrue(self.player._node_player_ready_event.is_set())
+
+    async def test_move_waits_for_lavalink_update_to_finish(self) -> None:
+        """Updating the channel alone does not complete a pending move."""
+        updating, release = Event(), Event()
+
+        async def voice_update(**_: object) -> None:
+            updating.set()
+            await release.wait()
+
+        async with asyncio.timeout(1):
+            with patch.object(Node, "voice_update", side_effect=voice_update):
+                move = asyncio.create_task(self.player.move_to(self.target))
+                await self.sent.wait()
+                callback = asyncio.create_task(self.voice_state_update(20))
+                await updating.wait()
+                self.assertIs(self.player.channel, self.target)
+                self.assertFalse(move.done())
+                release.set()
+                await callback
+                await move
+
+    async def test_move_accepts_stage_channel(self) -> None:
+        """The shared voice and stage channel surface works with every adapter."""
+        self.target = Mock(spec=StageChannel, id=20, guild=self.guild)
+        self.guild.get_channel.return_value = self.target
+        self.guild.get_channel.side_effect = None
+
+        async def confirm(*, channel: StageChannel) -> None:
+            self.assertIs(channel, self.target)
+            await self.voice_state_update(20)
+
+        self.guild.change_voice_state.side_effect = confirm
+        with patch.object(Node, "voice_update", AsyncMock()):
+            await self.player.move_to(self.target, timeout=1)
+        self.assertIs(self.player.channel, self.target)
+
+    async def test_move_rejects_invalid_targets(self) -> None:
+        """Invalid types and other guilds fail before changing voice state."""
+        for target in (None, object()):
+            with self.subTest(target=target), self.assertRaises(TypeError):
+                await self.player.move_to(cast("VoiceChannel", target))
+
+        other = Mock(spec=VoiceChannel, id=20, guild=Mock(spec=Guild, id=2))
+        with self.assertRaises(ValueError):
+            await self.player.move_to(other)
+        self.guild.change_voice_state.assert_not_awaited()
+
+    async def test_move_requires_connected_player(self) -> None:
+        """Moving a disconnected player cannot implicitly start a connection."""
+        self.player._connected = False
+        with self.assertRaises(PlayerNotConnected):
+            await self.player.move_to(self.target)
+        self.guild.change_voice_state.assert_not_awaited()
+
+    async def test_timeout_does_not_break_next_move(self) -> None:
+        """A late update from a timed out move cannot complete another target."""
+        with self.assertRaises(asyncio.TimeoutError):
+            await self.player.move_to(self.target, timeout=0.01)
+        self.assertIs(self.player.channel, self.channel)
+        self.assertFalse(self.player._voice_state_update_event.is_set())
+        self.assertTrue(self.player._voice_server_update_event.is_set())
+        self.assertTrue(self.player._node_player_ready_event.is_set())
+
+        other = Mock(spec=VoiceChannel, id=30, guild=self.guild)
+        self.guild.get_channel.side_effect = {20: self.target, 30: other}.get
+        self.sent.clear()
+        async with asyncio.timeout(1):
+            with patch.object(Node, "voice_update", AsyncMock()):
+                move = asyncio.create_task(self.player.move_to(other))
+                await self.sent.wait()
+                await self.voice_state_update(20)
+                await asyncio.sleep(0)
+                self.assertFalse(move.done())
+                await self.voice_state_update(30)
+                await move
+        self.assertIs(self.player.channel, other)
+
+    async def test_failed_request_does_not_break_next_move(self) -> None:
+        """A failed gateway request leaves no pending synchronization behind."""
+        self.guild.change_voice_state.side_effect = RuntimeError("gateway unavailable")
+        with self.assertRaisesRegex(RuntimeError, "gateway unavailable"):
+            await self.player.move_to(self.target)
+        self.assertFalse(self.player._voice_state_update_event.is_set())
+        self.assertIs(self.player.channel, self.channel)
+
+        async def confirm(*, channel: VoiceChannel) -> None:
+            await self.voice_state_update(channel.id)
+
+        self.guild.change_voice_state.side_effect = confirm
+        with patch.object(Node, "voice_update", AsyncMock()):
+            await self.player.move_to(self.target, timeout=1)
+        self.assertIs(self.player.channel, self.target)
+
+    async def test_cancelled_move_does_not_break_next_move(self) -> None:
+        """Cancellation releases the waiter without consuming future updates."""
+        async with asyncio.timeout(1):
+            move = asyncio.create_task(self.player.move_to(self.target))
+            await self.sent.wait()
+            move.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await move
+            self.assertFalse(self.player._voice_state_update_event.is_set())
+
+            self.sent.clear()
+            with patch.object(Node, "voice_update", AsyncMock()):
+                retry = asyncio.create_task(self.player.move_to(self.target))
+                await self.sent.wait()
+                await self.voice_state_update(20)
+                await retry
+        self.assertIs(self.player.channel, self.target)
 
     async def test_channel_move_dispatches_update_with_unchanged_session(self) -> None:
         """A voice channel move updates DAVE's required channel ID."""

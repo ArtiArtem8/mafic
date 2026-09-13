@@ -487,6 +487,72 @@ class Player(VoiceProtocol, Generic[ClientT]):
             await self.disconnect(force=True)
             raise asyncio.TimeoutError
 
+    async def move_to(
+        self,
+        channel: VoiceChannel | StageChannel,
+        *,
+        timeout: float = 30.0,
+    ) -> None:
+        """Move the player to another voice or stage channel in the same guild.
+
+        Parameters
+        ----------
+        channel:
+            The voice or stage channel to move to. Moving to the current channel
+            does nothing. Use :meth:`disconnect` to leave voice.
+        timeout:
+            Maximum time in seconds to request and confirm the channel change.
+
+        Raises
+        ------
+        TypeError
+            If the channel is not a voice or stage channel.
+        ValueError
+            If the channel belongs to another guild.
+        PlayerNotConnected
+            If the player is not connected to a voice channel.
+        asyncio.TimeoutError
+            If the voice state callback does not confirm the target in time.
+            Discord may still complete the move after this timeout.
+
+        Notes
+        -----
+        Completion waits for the voice state callback, including its Lavalink
+        voice update. A new voice server update is not required for every move;
+        any that arrives is handled by the existing voice server callback.
+        """
+        if not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+            channel, (VoiceChannel, StageChannel)
+        ):
+            msg = "Voice channel must be a VoiceChannel or StageChannel."
+            raise TypeError(msg)
+        if channel.guild.id != self.guild.id:
+            msg = "Voice channel must belong to the player's guild."
+            raise ValueError(msg)
+        if not self._connected:
+            raise PlayerNotConnected
+
+        if (
+            isinstance(self.channel, (VoiceChannel, StageChannel))
+            and self.channel.id == channel.id
+        ):
+            return
+
+        self._voice_state_update_event.clear()
+        try:
+            async with asyncio.timeout(timeout):
+                await self.guild.change_voice_state(channel=channel)
+                while True:
+                    await self._voice_state_update_event.wait()
+                    self._voice_state_update_event.clear()
+                    if (
+                        isinstance(self.channel, (VoiceChannel, StageChannel))
+                        and self.channel.id == channel.id
+                    ):
+                        return
+        finally:
+            self._voice_state_update_event.clear()
+
     async def disconnect(self, *, force: bool = False) -> None:
         """Disconnect from the voice channel.
 
