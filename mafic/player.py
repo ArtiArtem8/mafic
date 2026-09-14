@@ -116,13 +116,15 @@ class Player(VoiceProtocol, Generic[ClientT]):
         # Used to get the last track for TrackEndEvent.
         self._last_track: Track | None = None
         self._paused: bool = False
+        self._volume: int = 100
 
         self._voice_server_update_event: Event = Event()
         self._voice_state_update_event: Event = Event()
         self._node_player_ready_event: Event = Event()
         self._move_lock: Lock = Lock()
         self._voice_update_lock: Lock = Lock()
-        self._disconnecting: bool = False
+        # Terminal for this instance; reconnect creates a new Discord protocol.
+        self._disconnect_requested: bool = False
 
     def set_state(self, state: PlayerPayload) -> None:
         """Set the state of the player.
@@ -133,20 +135,25 @@ class Player(VoiceProtocol, Generic[ClientT]):
             You should not need to use this.
         """
         self._session_id = state["voice"]["sessionId"]
-        self._last_update = state["state"]["time"]
-        self._position = state["state"]["position"]
-        self._connected = state["state"]["connected"]
-        self._ping = state["state"]["ping"]
-        self._current = (
-            Track.from_data_with_info(state["track"]) if state["track"] else None
-        )
+        self.endpoint = state["voice"]["endpoint"]
+        track = Track.from_data_with_info(state["track"]) if state["track"] else None
+        self._sync_playback_state(state, track)
         self._filters = OrderedDict({"RESUME": Filter.from_payload(state["filters"])})
-        self._paused = state["paused"]
         self._server_state = {
             "token": state["voice"]["token"],
             "endpoint": state["voice"]["endpoint"],
             "guild_id": self._guild_id,
         }
+
+    def _sync_playback_state(self, state: PlayerPayload, track: Track | None) -> None:
+        """Apply REST playback state without replacing Discord voice credentials."""
+        self._current = track
+        self._last_update = state["state"]["time"]
+        self._position = state["state"]["position"]
+        self._connected = state["state"]["connected"]
+        self._ping = state["state"]["ping"]
+        self._volume = state["volume"]
+        self._paused = state["paused"]
 
     def __repr__(self) -> str:
         """Return a string representation of the player."""
@@ -253,22 +260,22 @@ class Player(VoiceProtocol, Generic[ClientT]):
 
     async def _dispatch_player_update_unlocked(self) -> None:
         """Dispatch using current state while holding `_voice_update_lock`."""
-        if self._disconnecting:
+        if self._disconnect_requested:
             return
 
         node = self._node
         if node is None:
-            _log.debug("Recieved voice update before node was found.")
+            _log.debug("Received voice update before node was found.")
             return
 
         session_id = self._session_id
         if session_id is None:
-            _log.debug("Receieved player update before session ID was set.")
+            _log.debug("Received player update before session ID was set.")
             return
 
         server_state = self._server_state
         if server_state is None:
-            _log.debug("Receieved player update before server state was found")
+            _log.debug("Received player update before server state was found.")
             return
 
         channel = self.channel
@@ -385,7 +392,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
         data:
             The voice state update payload.
         """
-        if self._disconnecting:
+        if self._disconnect_requested:
             return
 
         before_session_id = self._session_id
@@ -399,8 +406,6 @@ class Player(VoiceProtocol, Generic[ClientT]):
         channel_id = data["channel_id"]
 
         if channel_id is None:  # pyright: ignore[reportUnnecessaryComparison]
-            # This can happen and is on disconnect.
-            # Not sure why this is typed as always Snowflake.
             await self.disconnect(force=True)
             return
 
@@ -427,7 +432,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
             The voice server update payload.
         """
         async with self._voice_update_lock:
-            if self._disconnecting:
+            if self._disconnect_requested:
                 return
 
             current_node = self._node
@@ -452,17 +457,14 @@ class Player(VoiceProtocol, Generic[ClientT]):
 
             # Discord owns these credentials even if node migration later fails.
             self._guild_id = int(data["guild_id"])
-            self._endpoint = data["endpoint"]
+            self.endpoint = data["endpoint"]
             self._server_state = data
 
-            if current_node is None:
-                self._node = selected_node
-                self._node.add_player(self._guild_id, self)
-                await self._dispatch_player_update_unlocked()
-            elif selected_node is not current_node:
+            if current_node is not None and selected_node is not current_node:
                 await self._transfer_to_unlocked(selected_node)
             else:
-                current_node.add_player(self._guild_id, self)
+                self._node = selected_node
+                selected_node.add_player(self._guild_id, self)
                 await self._dispatch_player_update_unlocked()
 
         self._voice_server_update_event.set()
@@ -563,7 +565,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
         voice protocol. Disconnect is independent of this queue; an interrupted
         move may time out, and queued moves recheck the protocol registration.
         """
-        if self._disconnecting:
+        if self._disconnect_requested:
             raise PlayerNotConnected
 
         if not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
@@ -576,7 +578,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
             raise ValueError(msg)
         async with asyncio.timeout(timeout):
             async with self._move_lock:
-                if self.guild.voice_client is not self:
+                if self._disconnect_requested or self.guild.voice_client is not self:
                     raise PlayerNotConnected
                 if (
                     isinstance(self.channel, (VoiceChannel, StageChannel))
@@ -613,20 +615,21 @@ class Player(VoiceProtocol, Generic[ClientT]):
         if self.client.is_closed():
             return
 
-        self._disconnecting = True
+        self._disconnect_requested = True
         _log.debug(
             "Disconnecting player and destroying client.",
             extra={"guild": self._guild_id},
         )
         async with self._voice_update_lock:
-            if self._node is not None:
-                self._node.remove_player(self.guild.id)
+            node = self._node
+            if node is not None:
+                node.remove_player(self.guild.id)
                 try:
-                    await self._node.destroy(guild_id=self.guild.id)
+                    await node.destroy(guild_id=self.guild.id)
                 except Exception:  # noqa: BLE001 - leave/cleanup must continue
                     _log.exception(
                         "Failed to destroy player during disconnect.",
-                        extra={"guild": self.guild.id},
+                        extra={"guild": self.guild.id, "node": node.label},
                     )
                 finally:
                     self._node = None
@@ -650,7 +653,6 @@ class Player(VoiceProtocol, Generic[ClientT]):
         self._position = 0
         self._paused = False
         self._ping = 0
-        self._channel = None
         self._connected = False
 
         return super().cleanup()
@@ -666,10 +668,11 @@ class Player(VoiceProtocol, Generic[ClientT]):
         Raises
         ------
         PlayerNotConnected
-            If the player has no authoritative node or valid voice channel.
+            If disconnect has started, or the player has no authoritative node
+            or valid voice channel.
         RuntimeError
-            If the player has no session/server state or the old node snapshot
-            is incomplete.
+            If Discord session/server state or the old node snapshot is
+            incomplete, or Lavalink v3 track metadata is unavailable locally.
 
         Notes
         -----
@@ -683,11 +686,8 @@ class Player(VoiceProtocol, Generic[ClientT]):
 
     async def _transfer_to_unlocked(self, node: Node[ClientT]) -> None:
         """Transfer ownership while holding `_voice_update_lock`."""
-        if self._disconnecting:
-            raise PlayerNotConnected
-
         old_node = self._node
-        if old_node is None:
+        if self._disconnect_requested or old_node is None:
             raise PlayerNotConnected
 
         if old_node == node:
@@ -696,7 +696,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
         session_id = self._session_id
         server_state = self._server_state
         if session_id is None or server_state is None:
-            msg = "Cannot transfer player with session data."
+            msg = "Cannot transfer player without Discord session and server state."
             raise RuntimeError(msg)
 
         channel = self.channel
@@ -706,32 +706,12 @@ class Player(VoiceProtocol, Generic[ClientT]):
         snapshot = await old_node.fetch_player(self.guild.id)
         required = ("track", "volume", "paused", "state", "filters")
         if any(key not in snapshot for key in required):
-            msg = "Cannot transfer player without playback state."
+            msg = "Cannot transfer player without complete playback state."
             raise RuntimeError(msg)
 
-        if old_node.version == 3:
-            if snapshot["track"] is None:
-                snapshot_track = None
-            elif self._current is None:
-                msg = "Cannot restore Lavalink v3 track without local metadata."
-                raise RuntimeError(msg)
-            else:
-                snapshot_track = shallow_copy(self._current)
-                snapshot_track.id = cast("str", snapshot["track"])
-                snapshot_track.user_data = {}
-        else:
-            snapshot_track = (
-                Track.from_data_with_info(snapshot["track"])
-                if snapshot["track"] is not None
-                else None
-            )
+        snapshot_track = self._track_from_snapshot(snapshot, old_node.version)
         snapshot_filter = Filter.from_payload(snapshot["filters"])
-        local_filter = (
-            reduce(lambda left, right: left | right, self._filters.values())
-            if self._filters
-            else Filter()
-        )
-        labels_match_snapshot = local_filter.payload == snapshot["filters"]
+        labels_match_snapshot = self._merged_filter().payload == snapshot["filters"]
 
         try:
             await node.voice_update(
@@ -749,51 +729,25 @@ class Player(VoiceProtocol, Generic[ClientT]):
                 filter=snapshot_filter,
             )
         except Exception:
-            try:
-                await node.destroy(guild_id=self.guild.id)
-            except Exception:  # noqa: BLE001 - best-effort partial cleanup
-                _log.exception(
-                    "Failed to clean up partial target node player.",
-                    extra={"guild": self.guild.id},
-                )
+            await self._destroy_partial_target(node)
             raise
 
-        if self._disconnecting:
-            try:
-                await node.destroy(guild_id=self.guild.id)
-            except Exception:  # noqa: BLE001 - best-effort partial cleanup
-                _log.exception(
-                    "Failed to clean up partial target node player.",
-                    extra={"guild": self.guild.id},
-                )
+        if self._disconnect_requested:
+            await self._destroy_partial_target(node)
             raise PlayerNotConnected
 
-        # Commit ownership only after the target is fully prepared.
+        # Register only after preparation so target events cannot mutate the owner.
         node.add_player(self.guild.id, self)
         self._node = node
         old_node.remove_player(self.guild.id)
 
-        # Sync playback state from the actual target response. Voice credentials
-        # remain owned by on_voice_server_update; do not let a transient target
-        # response replace the authoritative Discord server state.
-        if node.version == 3:
-            self._current = snapshot_track
-        else:
-            self._current = (
-                Track.from_data_with_info(target_state["track"])
-                if target_state["track"] is not None
-                else None
-            )
-        self._last_update = target_state["state"]["time"]
-        self._position = target_state["state"]["position"]
-        self._connected = target_state["state"]["connected"]
-        self._ping = target_state["state"]["ping"]
-        self._volume = target_state["volume"]
-        self._paused = target_state["paused"]
-        if labels_match_snapshot:
-            # Labels already describe the authoritative merged filter payload.
-            pass
-        else:
+        target_track = (
+            snapshot_track
+            if node.version == 3
+            else self._track_from_snapshot(target_state, node.version)
+        )
+        self._sync_playback_state(target_state, target_track)
+        if not labels_match_snapshot:
             self._filters = OrderedDict({"RESUME": snapshot_filter})
 
         # The migration is committed; old cleanup is best-effort.
@@ -802,8 +756,33 @@ class Player(VoiceProtocol, Generic[ClientT]):
         except Exception:  # noqa: BLE001 - committed migration, cleanup only
             _log.exception(
                 "Failed to destroy old node player after transfer.",
-                extra={"guild": self.guild.id},
+                extra={"guild": self.guild.id, "node": old_node.label},
             )
+
+    async def _destroy_partial_target(self, node: Node[ClientT]) -> None:
+        """Best-effort cleanup of an uncommitted target, preserving the owner."""
+        try:
+            await node.destroy(guild_id=self.guild.id)
+        except Exception:  # noqa: BLE001 - preserve the preparation failure
+            _log.exception(
+                "Failed to clean up partial target node player.",
+                extra={"guild": self.guild.id, "node": node.label},
+            )
+
+    def _track_from_snapshot(self, state: PlayerPayload, version: int) -> Track | None:
+        """Restore the encoded track, using local metadata only for Lavalink v3."""
+        if state["track"] is None:
+            return None
+        if version != 3:
+            return Track.from_data_with_info(state["track"])
+        if self._current is None:
+            msg = "Cannot restore Lavalink v3 track without local metadata."
+            raise RuntimeError(msg)
+
+        track = shallow_copy(self._current)
+        track.id = cast("str", state["track"])
+        track.user_data = {}
+        return track
 
     async def destroy(self) -> None:  # noqa: D102
         warnings.warn(
@@ -1042,6 +1021,14 @@ class Player(VoiceProtocol, Generic[ClientT]):
         """
         await self.update(track=None, replace=True)
 
+    def _merged_filter(self) -> Filter:
+        """Merge labeled filters in their application order."""
+        return (
+            reduce(lambda left, right: left | right, self._filters.values())
+            if self._filters
+            else Filter()
+        )
+
     async def _update_filters(self, *, fast_apply: bool) -> None:
         """Update the filters on the player.
 
@@ -1050,13 +1037,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
         fast_apply:
             Whether to seek to the current position after updating the filters.
         """
-        await self.update(
-            filter=(
-                reduce(lambda left, right: left | right, self._filters.values())
-                if self._filters
-                else Filter()
-            )
-        )
+        await self.update(filter=self._merged_filter())
 
         if fast_apply:
             await self.seek(self.position)
