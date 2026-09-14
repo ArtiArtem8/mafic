@@ -13,6 +13,8 @@
 >
 > - Public access to the explicitly assigned player node.
 > - Public voice-channel movement without depending on Mafic internals.
+> - Public player transfer between nodes, including mixed Lavalink 3.7 / 4.2
+>   transfers.
 >
 > Upstream changes are kept separate so fixes can still be contributed back
 > as focused pull requests.
@@ -52,15 +54,38 @@ pip install "mafic @ git+https://github.com/artiartem8/mafic.git@<commit-sha>"
 ## Documentation
 
 [Upstream documentation](https://mafic.readthedocs.io/en/latest/) covers the shared
-Mafic API; this fork adds the Lavalink v4 fixes described above.
+Mafic API. The fork-specific player lifecycle API and its Lavalink 4.2 behavior
+are documented in this README and in the related docstrings.
 
 ## Features
 
 - Fully customisable node balancing.
-- Multi-node support.
+- Multi-node support with player transfer between nodes.
+- Public voice-channel movement.
 - Filters.
-- Full API coverage.
-- Properly typehinted for Pyright strict.
+- Lavalink 4.2 track metadata (`pluginInfo` / `userData`) round-tripping.
+- Lavalink 3.7 and 4.2 compatibility.
+- Strict typing for Pyright, covering the supported discord.py, nextcord,
+  disnake and py-cord adapters.
+
+## Player lifecycle
+
+- `Player.assigned_node` returns the Lavalink node currently assigned to the
+  player, or `None` when no node is assigned. Unlike `Player.node`, it never
+  selects a fallback node.
+- `Player.move_to(channel)` moves an active player to another voice or stage
+  channel in the same guild through public API only.
+- `Player.transfer_to(node)` transfers an active Lavalink player to another
+  node. The transfer preserves the current track, position, volume, pause state
+  and filters.
+- Lavalink v4 `userData` is preserved when the target node supports it.
+- Transfers between Lavalink 3.7 and 4.2 are supported. A transfer to a
+  Lavalink v3 target cannot preserve `userData`.
+- `disconnect()` is terminal for that `Player`; reconnecting creates a new
+  `VoiceProtocol` instance.
+- `move_to()` confirms the Discord channel transition and the corresponding
+  voice-state update. It does not guarantee that a later `VOICE_SERVER_UPDATE`
+  has already fully reconnected Lavalink.
 
 ## Usage
 
