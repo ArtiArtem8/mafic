@@ -11,6 +11,9 @@
 > (`pluginInfo` / `userData`) round-tripping, the current Update Player track
 > payload, and related protocol correctness fixes.
 >
+> - Public access to the explicitly assigned player node.
+> - Public voice-channel movement without depending on Mafic internals.
+>
 > Upstream changes are kept separate so fixes can still be contributed back
 > as focused pull requests.
 

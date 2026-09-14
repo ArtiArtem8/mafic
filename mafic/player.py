@@ -6,8 +6,9 @@ from __future__ import annotations
 
 import asyncio
 import warnings
-from asyncio import Event
+from asyncio import Event, Lock
 from collections import OrderedDict
+from copy import copy as shallow_copy
 from functools import reduce
 from logging import getLogger
 from time import time
@@ -115,10 +116,16 @@ class Player(VoiceProtocol, Generic[ClientT]):
         # Used to get the last track for TrackEndEvent.
         self._last_track: Track | None = None
         self._paused: bool = False
+        self._volume: int = 100
 
         self._voice_server_update_event: Event = Event()
         self._voice_state_update_event: Event = Event()
         self._node_player_ready_event: Event = Event()
+        self._move_lock: Lock = Lock()
+        self._voice_update_lock: Lock = Lock()
+        # Terminal for this instance; reconnect creates a new Discord protocol.
+        self._disconnect_requested: bool = False
+        self._disconnect_task: asyncio.Task[None] | None = None
 
     def set_state(self, state: PlayerPayload) -> None:
         """Set the state of the player.
@@ -129,20 +136,25 @@ class Player(VoiceProtocol, Generic[ClientT]):
             You should not need to use this.
         """
         self._session_id = state["voice"]["sessionId"]
-        self._last_update = state["state"]["time"]
-        self._position = state["state"]["position"]
-        self._connected = state["state"]["connected"]
-        self._ping = state["state"]["ping"]
-        self._current = (
-            Track.from_data_with_info(state["track"]) if state["track"] else None
-        )
+        self.endpoint = state["voice"]["endpoint"]
+        track = Track.from_data_with_info(state["track"]) if state["track"] else None
+        self._sync_playback_state(state, track)
         self._filters = OrderedDict({"RESUME": Filter.from_payload(state["filters"])})
-        self._paused = state["paused"]
         self._server_state = {
             "token": state["voice"]["token"],
             "endpoint": state["voice"]["endpoint"],
             "guild_id": self._guild_id,
         }
+
+    def _sync_playback_state(self, state: PlayerPayload, track: Track | None) -> None:
+        """Apply REST playback state without replacing Discord voice credentials."""
+        self._current = track
+        self._last_update = state["state"]["time"]
+        self._position = state["state"]["position"]
+        self._connected = state["state"]["connected"]
+        self._ping = state["state"]["ping"]
+        self._volume = state["volume"]
+        self._paused = state["paused"]
 
     def __repr__(self) -> str:
         """Return a string representation of the player."""
@@ -182,7 +194,12 @@ class Player(VoiceProtocol, Generic[ClientT]):
 
     @property
     def node(self) -> Node[ClientT]:
-        """The node that the player is connected to."""
+        """The assigned node, or a usable node from the pool.
+
+        If no node is assigned, this selects a random available node without
+        assigning it to the player. Use :attr:`assigned_node` to inspect the
+        current assignment without selecting a fallback.
+        """
         if self._node is None:
             _log.warning(
                 "Unable to use best node, player not connected, finding random node.",
@@ -190,6 +207,15 @@ class Player(VoiceProtocol, Generic[ClientT]):
             )
             return NodePool[ClientT].get_random_node()
 
+        return self._node
+
+    @property
+    def assigned_node(self) -> Node[ClientT] | None:
+        """The node explicitly assigned to this player, if any.
+
+        Unlike :attr:`node`, this only reports the current assignment. It returns
+        ``None`` when unassigned and never selects or assigns a fallback node.
+        """
         return self._node
 
     @property
@@ -230,27 +256,39 @@ class Player(VoiceProtocol, Generic[ClientT]):
 
     async def _dispatch_player_update(self) -> None:
         """Dispatch a player update to the node."""
-        if self._node is None:
-            _log.debug("Recieved voice update before node was found.")
+        async with self._voice_update_lock:
+            await self._dispatch_player_update_unlocked()
+
+    async def _dispatch_player_update_unlocked(self) -> None:
+        """Dispatch using current state while holding `_voice_update_lock`."""
+        if self._disconnect_requested:
             return
 
-        if self._session_id is None:
-            _log.debug("Receieved player update before session ID was set.")
+        node = self._node
+        if node is None:
+            _log.debug("Received voice update before node was found.")
             return
 
-        if self._server_state is None:
-            _log.debug("Receieved player update before server state was found")
+        session_id = self._session_id
+        if session_id is None:
+            _log.debug("Received player update before session ID was set.")
             return
 
-        if not isinstance(self.channel, (VoiceChannel, StageChannel)):
+        server_state = self._server_state
+        if server_state is None:
+            _log.debug("Received player update before server state was found.")
+            return
+
+        channel = self.channel
+        if not isinstance(channel, (VoiceChannel, StageChannel)):
             _log.debug("Received player update before channel was set.")
             return
 
-        await self._node.voice_update(
+        await node.voice_update(
             guild_id=self._guild_id,
-            session_id=self._session_id,
-            data=self._server_state,
-            channel_id=int(self.channel.id),
+            session_id=session_id,
+            data=server_state,
+            channel_id=int(channel.id),
         )
 
     def dispatch_event(self, data: EventPayload) -> None:
@@ -355,6 +393,9 @@ class Player(VoiceProtocol, Generic[ClientT]):
         data:
             The voice state update payload.
         """
+        if self._disconnect_requested:
+            return
+
         before_session_id = self._session_id
         before_channel_id = (
             self.channel.id
@@ -366,8 +407,6 @@ class Player(VoiceProtocol, Generic[ClientT]):
         channel_id = data["channel_id"]
 
         if channel_id is None:  # pyright: ignore[reportUnnecessaryComparison]
-            # This can happen and is on disconnect.
-            # Not sure why this is typed as always Snowflake.
             await self.disconnect(force=True)
             return
 
@@ -393,30 +432,41 @@ class Player(VoiceProtocol, Generic[ClientT]):
         data:
             The voice server update payload.
         """
-        # Fetch the best node as we either don't know the best one yet.
-        # Or the node we were using was not the best one (endpoint optimisation).
-        if (
-            self._node is None
-            or self._server_state is None
-            or self._server_state["endpoint"] != data["endpoint"]
-        ):
-            _log.debug("Getting best node for player", extra={"guild": self._guild_id})
-            self._node = NodePool[ClientT].get_node(
-                guild_id=data["guild_id"], endpoint=data["endpoint"]
-            )
-            _log.debug(
-                "Got best node for player: %s",
-                self._node.label,
-                extra={"guild": self._guild_id},
-            )
+        async with self._voice_update_lock:
+            if self._disconnect_requested:
+                return
 
-        self._node.add_player(self._guild_id, self)
+            current_node = self._node
+            if (
+                current_node is None
+                or self._server_state is None
+                or self._server_state["endpoint"] != data["endpoint"]
+            ):
+                _log.debug(
+                    "Getting best node for player", extra={"guild": self._guild_id}
+                )
+                selected_node = NodePool[ClientT].get_node(
+                    guild_id=data["guild_id"], endpoint=data["endpoint"]
+                )
+                _log.debug(
+                    "Got best node for player: %s",
+                    selected_node.label,
+                    extra={"guild": self._guild_id},
+                )
+            else:
+                selected_node = current_node
 
-        self._guild_id = int(data["guild_id"])
-        self._endpoint = data["endpoint"]
-        self._server_state = data
+            # Discord owns these credentials even if node migration later fails.
+            self._guild_id = int(data["guild_id"])
+            self.endpoint = data["endpoint"]
+            self._server_state = data
 
-        await self._dispatch_player_update()
+            if current_node is not None and selected_node is not current_node:
+                await self._transfer_to_unlocked(selected_node)
+            else:
+                self._node = selected_node
+                selected_node.add_player(self._guild_id, self)
+                await self._dispatch_player_update_unlocked()
 
         self._voice_server_update_event.set()
 
@@ -473,6 +523,84 @@ class Player(VoiceProtocol, Generic[ClientT]):
             await self.disconnect(force=True)
             raise asyncio.TimeoutError
 
+    async def move_to(
+        self,
+        channel: VoiceChannel | StageChannel,
+        *,
+        timeout: float = 30.0,
+    ) -> None:
+        """Move the player to another voice or stage channel in the same guild.
+
+        Parameters
+        ----------
+        channel:
+            The voice or stage channel to move to. Moving to the current channel
+            does nothing. Use :meth:`disconnect` to leave voice.
+        timeout:
+            Maximum time in seconds to wait for earlier moves, request and
+            confirm the channel change.
+
+        Raises
+        ------
+        TypeError
+            If the channel is not a voice or stage channel.
+        ValueError
+            If the channel belongs to another guild.
+        PlayerNotConnected
+            If this player is no longer the guild's active Discord voice protocol.
+        asyncio.TimeoutError
+            If the voice state callback does not confirm the target in time.
+            Discord may still complete the move after this timeout.
+
+        Notes
+        -----
+        Moves on this player are serialized in arrival order. Completion confirms
+        the Discord channel transition and the voice state callback's Lavalink
+        request. It does not guarantee a ready Lavalink voice connection: a later
+        voice server update can replace the credentials and trigger reconnection,
+        even after Lavalink briefly reported connected. Server updates are handled
+        independently and are not required to complete every move. Lavalink
+        voice updates are serialized per player.
+
+        A temporary Lavalink disconnect does not prevent moving an active Discord
+        voice protocol. Disconnect is independent of this queue; an interrupted
+        move may time out, and queued moves recheck the protocol registration.
+        """
+        if self._disconnect_requested:
+            raise PlayerNotConnected
+
+        if not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+            channel, (VoiceChannel, StageChannel)
+        ):
+            msg = "Voice channel must be a VoiceChannel or StageChannel."
+            raise TypeError(msg)
+        if channel.guild.id != self.guild.id:
+            msg = "Voice channel must belong to the player's guild."
+            raise ValueError(msg)
+        async with asyncio.timeout(timeout):
+            async with self._move_lock:
+                if self._disconnect_requested or self.guild.voice_client is not self:
+                    raise PlayerNotConnected
+                if (
+                    isinstance(self.channel, (VoiceChannel, StageChannel))
+                    and self.channel.id == channel.id
+                ):
+                    return
+
+                self._voice_state_update_event.clear()
+                try:
+                    await self.guild.change_voice_state(channel=channel)
+                    while True:
+                        await self._voice_state_update_event.wait()
+                        self._voice_state_update_event.clear()
+                        if (
+                            isinstance(self.channel, (VoiceChannel, StageChannel))
+                            and self.channel.id == channel.id
+                        ):
+                            return
+                finally:
+                    self._voice_state_update_event.clear()
+
     async def disconnect(self, *, force: bool = False) -> None:
         """Disconnect from the voice channel.
 
@@ -480,31 +608,80 @@ class Player(VoiceProtocol, Generic[ClientT]):
         ----------
         force:
             Whether to force the disconnect even if not connected.
+
+        Notes
+        -----
+        Concurrent calls share one teardown. Once disconnect starts, cancellation
+        is propagated only after teardown completes.
         """
-        if not self._connected and not force:
-            return
+        task = self._disconnect_task
+        if task is None:
+            if not force and self.guild.voice_client is not self:
+                return
 
-        # Handled by Discord
-        if self.client.is_closed():
-            return
+            # Handled by Discord
+            if self.client.is_closed():
+                return
 
+            self._disconnect_requested = True
+            task = self._disconnect_task = asyncio.create_task(self._disconnect_voice())
+
+        await self._await_voice_cleanup(task)
+
+    async def _await_voice_cleanup(self, task: asyncio.Task[None]) -> None:
+        """Wait for voice cleanup before propagating caller cancellation."""
+        # Caller cancellation must not cancel the shared teardown or other waiters.
+        cancelled: asyncio.CancelledError | None = None
+        while True:
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as exc:
+                if task.cancelled():
+                    raise
+                cancelled = exc
+            except Exception:
+                if cancelled is None:
+                    raise
+                _log.exception(
+                    "Failed to finish voice cleanup after caller cancellation.",
+                    extra={"guild": self._guild_id},
+                )
+                break
+            else:
+                break
+
+        if cancelled is not None:
+            raise cancelled
+
+    async def _disconnect_voice(self) -> None:
+        """Finish terminal voice teardown once for all disconnect callers."""
         _log.debug(
             "Disconnecting player and destroying client.",
             extra={"guild": self._guild_id},
         )
-        if self._node is not None:
-            self._node.remove_player(self.guild.id)
-            await self._node.destroy(guild_id=self.guild.id)
+        async with self._voice_update_lock:
+            node = self._node
+            if node is not None:
+                node.remove_player(self.guild.id)
+                try:
+                    await node.destroy(guild_id=self.guild.id)
+                except Exception:  # noqa: BLE001 - leave/cleanup must continue
+                    _log.exception(
+                        "Failed to destroy player during disconnect.",
+                        extra={"guild": self.guild.id, "node": node.label},
+                    )
+                finally:
+                    self._node = None
 
-        try:
-            _log.debug(
-                "Disconnecting from voice channel.",
-                extra={"guild": self._guild_id},
-            )
-            await self.guild.change_voice_state(channel=None)
-        finally:
-            self.cleanup()
-            self._connected = False
+            try:
+                _log.debug(
+                    "Disconnecting from voice channel.",
+                    extra={"guild": self._guild_id},
+                )
+                await self.guild.change_voice_state(channel=None)
+            finally:
+                self.cleanup()
+                self._connected = False
 
     def cleanup(self) -> None:
         """Clean up the player.
@@ -515,7 +692,6 @@ class Player(VoiceProtocol, Generic[ClientT]):
         self._position = 0
         self._paused = False
         self._ping = 0
-        self._channel = None
         self._connected = False
 
         return super().cleanup()
@@ -527,56 +703,140 @@ class Player(VoiceProtocol, Generic[ClientT]):
         ----------
         node:
             The node to transfer to.
+
+        Raises
+        ------
+        PlayerNotConnected
+            If disconnect has started, or the player has no authoritative node
+            or valid voice channel.
+        RuntimeError
+            If Discord session/server state or the old node snapshot is
+            incomplete, or Lavalink v3 track metadata is unavailable locally.
+
+        Notes
+        -----
+        The target node is prepared before ownership is committed. If target
+        preparation fails, the old node remains authoritative and its Lavalink
+        player is preserved. After a successful commit, failure to destroy the
+        old Lavalink player is logged and does not roll back the transfer.
+        Cancellation during old-node cleanup waits for it to finish before
+        propagating. A Lavalink v3 target cannot preserve track user data.
         """
-        if self._node is None:
+        async with self._voice_update_lock:
+            await self._transfer_to_unlocked(node)
+
+    async def _transfer_to_unlocked(self, node: Node[ClientT]) -> None:
+        """Transfer ownership while holding `_voice_update_lock`."""
+        old_node = self._node
+        if self._disconnect_requested or old_node is None:
             raise PlayerNotConnected
 
-        if self._node == node:
+        if old_node == node:
             return
 
-        state = await self._node.fetch_player(self.guild.id)
-
-        # Remove from the current node, but no need to destroy.
-        self._node.remove_player(self.guild.id)
-
-        old_node = self._node
-        self._node = node
-        self._node.add_player(self.guild.id, self)
-
-        if self._session_id is None or self._server_state is None:
-            msg = "Cannot transfer player with session data."
+        session_id = self._session_id
+        server_state = self._server_state
+        if session_id is None or server_state is None:
+            msg = "Cannot transfer player without Discord session and server state."
             raise RuntimeError(msg)
 
-        if not isinstance(self.channel, (VoiceChannel, StageChannel)):
-            msg = "Voice channel must be a VoiceChannel or StageChannel."
-            _log.warning(msg)
-            return
+        channel = self.channel
+        if not isinstance(channel, (VoiceChannel, StageChannel)):
+            raise PlayerNotConnected
 
-        # We need to update the voice server as the endpoint may have changed.
-        await self._node.voice_update(
-            guild_id=self._guild_id,
-            session_id=self._session_id,
-            data=self._server_state,
-            channel_id=int(self.channel.id),
+        snapshot = await old_node.fetch_player(self.guild.id)
+        required = ("track", "volume", "paused", "state", "filters")
+        if any(key not in snapshot for key in required):
+            msg = "Cannot transfer player without complete playback state."
+            raise RuntimeError(msg)
+
+        snapshot_track = self._track_from_snapshot(snapshot, old_node.version)
+        prepared_track = self._track_for_target(snapshot_track, node.version)
+        snapshot_filter = Filter.from_payload(snapshot["filters"])
+        labels_match_snapshot = self._merged_filter().payload == snapshot["filters"]
+
+        try:
+            await node.voice_update(
+                guild_id=self._guild_id,
+                session_id=session_id,
+                data=server_state,
+                channel_id=int(channel.id),
+            )
+            target_state = await node.update(
+                guild_id=self._guild_id,
+                track=prepared_track,
+                position=snapshot["state"]["position"],
+                volume=snapshot["volume"],
+                pause=snapshot["paused"],
+                filter=snapshot_filter,
+            )
+        except (Exception, asyncio.CancelledError):
+            await self._destroy_partial_target(node)
+            raise
+
+        if self._disconnect_requested:
+            await self._destroy_partial_target(node)
+            raise PlayerNotConnected
+
+        # Register only after preparation so target events cannot mutate the owner.
+        node.add_player(self.guild.id, self)
+        self._node = node
+        old_node.remove_player(self.guild.id)
+
+        target_track = (
+            prepared_track
+            if node.version == 3
+            else self._track_from_snapshot(target_state, node.version)
         )
+        self._sync_playback_state(target_state, target_track)
+        if not labels_match_snapshot:
+            self._filters = OrderedDict({"RESUME": snapshot_filter})
 
-        # Needed so .update does not fail.
-        self._connected = True
-        # Update player with all other state.
-        # Position, filters, track, etc.
-        await self.update(
-            track=self._current,
-            position=self.position,
-            volume=state["volume"],
-            pause=self._paused,
-            filter=(
-                reduce(lambda left, right: left | right, self._filters.values())
-                if self._filters
-                else Filter()
-            ),
-        )
+        # The migration is committed; old cleanup is best-effort.
+        try:
+            await self._await_voice_cleanup(
+                asyncio.create_task(old_node.destroy(guild_id=self.guild.id))
+            )
+        except Exception:  # noqa: BLE001 - committed migration, cleanup only
+            _log.exception(
+                "Failed to destroy old node player after transfer.",
+                extra={"guild": self.guild.id, "node": old_node.label},
+            )
 
-        await old_node.destroy(guild_id=self.guild.id)
+    async def _destroy_partial_target(self, node: Node[ClientT]) -> None:
+        """Best-effort cleanup of an uncommitted target, preserving the owner."""
+        try:
+            await node.destroy(guild_id=self.guild.id)
+        except Exception:  # noqa: BLE001 - preserve the preparation failure
+            _log.exception(
+                "Failed to clean up partial target node player.",
+                extra={"guild": self.guild.id, "node": node.label},
+            )
+
+    @staticmethod
+    def _track_for_target(track: Track | None, target_version: int) -> Track | None:
+        """Adapt a parsed snapshot track to the target without mutating the source."""
+        if track is None or target_version != 3:
+            return track
+        adapted = shallow_copy(track)
+        adapted.user_data = {}
+        return adapted
+
+    def _track_from_snapshot(self, state: PlayerPayload, version: int) -> Track | None:
+        """Restore the encoded track, using local metadata only for Lavalink v3."""
+        if state["track"] is None:
+            return None
+        if version != 3:
+            return Track.from_data_with_info(state["track"])
+        if self._current is None:
+            msg = "Cannot restore Lavalink v3 track without local metadata."
+            raise RuntimeError(msg)
+
+        track = shallow_copy(self._current)
+        track.id = cast("str", state["track"])
+        # A v3 snapshot has no user data; cached local values are not authoritative.
+        track.user_data = {}
+        return track
 
     async def destroy(self) -> None:  # noqa: D102
         warnings.warn(
@@ -815,6 +1075,14 @@ class Player(VoiceProtocol, Generic[ClientT]):
         """
         await self.update(track=None, replace=True)
 
+    def _merged_filter(self) -> Filter:
+        """Merge labeled filters in their application order."""
+        return (
+            reduce(lambda left, right: left | right, self._filters.values())
+            if self._filters
+            else Filter()
+        )
+
     async def _update_filters(self, *, fast_apply: bool) -> None:
         """Update the filters on the player.
 
@@ -823,13 +1091,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
         fast_apply:
             Whether to seek to the current position after updating the filters.
         """
-        await self.update(
-            filter=(
-                reduce(lambda left, right: left | right, self._filters.values())
-                if self._filters
-                else Filter()
-            )
-        )
+        await self.update(filter=self._merged_filter())
 
         if fast_apply:
             await self.seek(self.position)
