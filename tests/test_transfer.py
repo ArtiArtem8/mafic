@@ -323,6 +323,190 @@ class NodeTransferTests(IsolatedAsyncioTestCase):
         self.assertIsNone(self.player.current)
         self.assertEqual(self.player.position, 0)
 
+    async def assert_cancelled_transfer_preserves_owner(
+        self, phase: str, *, cleanup_fails: bool
+    ) -> None:
+        """Cancel preparation and wait for partial cleanup before propagation."""
+        self.setUp()
+        old_node = self.make_owner()
+        target = self.make_node("B")
+        preparing, cleaning, release_cleanup = Event(), Event(), Event()
+
+        async def prepare(**_: object) -> None:
+            preparing.set()
+            await Event().wait()
+
+        async def destroy(*, guild_id: int) -> None:
+            self.assertEqual(guild_id, 1)
+            cleaning.set()
+            await release_cleanup.wait()
+            if cleanup_fails:
+                msg = "partial cleanup failed"
+                raise RuntimeError(msg)
+
+        getattr(target, phase).side_effect = prepare
+        target.destroy.side_effect = destroy
+        async with asyncio.timeout(1):
+            transfer = asyncio.create_task(
+                self.player.transfer_to(cast("Node[Client]", target))
+            )
+            await preparing.wait()
+            transfer.cancel()
+            try:
+                await cleaning.wait()
+                self.assertFalse(transfer.done())
+            finally:
+                release_cleanup.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await transfer
+
+        self.assertIs(self.player.assigned_node, old_node)
+        self.assertIs(old_node.get_player(1), self.player)
+        old_node.destroy.assert_not_awaited()
+        target.destroy.assert_awaited_once_with(guild_id=1)
+        target.add_player.assert_not_called()
+        self.assertIsNone(target.get_player(1))
+        if phase == "voice_update":
+            target.update.assert_not_awaited()
+
+    async def test_transfer_cancelled_during_target_voice_update(self) -> None:
+        """Cancellation of target voice preparation keeps A and cleans partial B."""
+        for cleanup_fails in (False, True):
+            with self.subTest(cleanup_fails=cleanup_fails):
+                await self.assert_cancelled_transfer_preserves_owner(
+                    "voice_update", cleanup_fails=cleanup_fails
+                )
+
+    async def test_transfer_cancelled_during_target_update(self) -> None:
+        """Cancellation of playback restoration keeps A and cleans partial B."""
+        for cleanup_fails in (False, True):
+            with self.subTest(cleanup_fails=cleanup_fails):
+                await self.assert_cancelled_transfer_preserves_owner(
+                    "update", cleanup_fails=cleanup_fails
+                )
+
+    def assert_disconnected(self, node: SimpleNamespace, cleanup: Mock) -> None:
+        """Assert terminal ownership, adapter cleanup and a single teardown."""
+        self.assertIsNone(self.player.assigned_node)
+        self.assertIsNone(node.get_player(1))
+        self.assertTrue(self.player._disconnect_requested)
+        self.assertFalse(self.player.connected)
+        self.assertIsNone(self.player.current)
+        self.assertEqual(self.player.position, 0)
+        node.destroy.assert_awaited_once_with(guild_id=1)
+        self.guild.change_voice_state.assert_awaited_once_with(channel=None)
+        cleanup.assert_called_once()
+
+    async def test_disconnect_cancelled_before_voice_lock(self) -> None:
+        """Terminal disconnect finishes when cancelled before acquiring the lock."""
+        node = self.make_owner()
+        self.guild.voice_client = self.player
+        started = Event()
+
+        async def disconnect() -> None:
+            started.set()
+            await self.player.disconnect()
+
+        with patch(
+            "mafic.player.VoiceProtocol.cleanup",
+            side_effect=lambda: setattr(self.guild, "voice_client", None),
+        ) as cleanup:
+            async with asyncio.timeout(1):
+                async with self.player._voice_update_lock:
+                    task = asyncio.create_task(disconnect())
+                    await started.wait()
+                    self.assertTrue(self.player._disconnect_requested)
+                    self.assertIs(self.player.assigned_node, node)
+                    task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+            self.assert_disconnected(node, cleanup)
+            self.assertIsNone(self.guild.voice_client)
+
+    async def assert_cancelled_disconnect_finishes(
+        self, phase: str, *, leave_fails: bool = False
+    ) -> None:
+        """Hold a teardown operation and cancel its caller before releasing it."""
+        node = self.make_owner()
+        self.guild.voice_client = self.player
+        entered, release, completed = Event(), Event(), Event()
+
+        async def block(**_: object) -> None:
+            entered.set()
+            await release.wait()
+            completed.set()
+            if leave_fails:
+                msg = "Discord leave failed"
+                raise RuntimeError(msg)
+
+        operation = (
+            node.destroy if phase == "destroy" else self.guild.change_voice_state
+        )
+        operation.side_effect = block
+        with patch("mafic.player.VoiceProtocol.cleanup") as cleanup:
+            async with asyncio.timeout(1):
+                task = asyncio.create_task(self.player.disconnect())
+                await entered.wait()
+                task.cancel()
+                release.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+            self.assertTrue(completed.is_set())
+            self.assert_disconnected(node, cleanup)
+
+    async def test_disconnect_cancelled_during_node_destroy(self) -> None:
+        """Cancellation during node destroy still leaves Discord and cleans up."""
+        await self.assert_cancelled_disconnect_finishes("destroy")
+
+    async def test_disconnect_cancelled_during_discord_leave(self) -> None:
+        """Cancellation during Discord leave propagates only after cleanup."""
+        await self.assert_cancelled_disconnect_finishes("leave")
+        with self.assertLogs("mafic.player", level="ERROR") as logs:
+            self.setUp()
+            await self.assert_cancelled_disconnect_finishes("leave", leave_fails=True)
+        self.assertIn("after caller cancellation", logs.output[0])
+        self.assertIn("Discord leave failed", logs.output[0])
+
+    async def assert_disconnect_shares_teardown(self, *, cancel_first: bool) -> None:
+        """Exercise shared teardown with an optional cancelled caller."""
+        self.setUp()
+        node = self.make_owner()
+        self.guild.voice_client = self.player
+        destroying, release, second_started = Event(), Event(), Event()
+
+        async def destroy(**_: object) -> None:
+            destroying.set()
+            await release.wait()
+
+        async def second_disconnect() -> None:
+            second_started.set()
+            await self.player.disconnect(force=True)
+
+        node.destroy.side_effect = destroy
+        with patch("mafic.player.VoiceProtocol.cleanup") as cleanup:
+            async with asyncio.timeout(1):
+                first = asyncio.create_task(self.player.disconnect())
+                await destroying.wait()
+                second = asyncio.create_task(second_disconnect())
+                await second_started.wait()
+                if cancel_first:
+                    first.cancel()
+                release.set()
+                results = await asyncio.gather(first, second, return_exceptions=True)
+                if cancel_first:
+                    self.assertIsInstance(results[0], asyncio.CancelledError)
+                else:
+                    self.assertIsNone(results[0])
+                self.assertIsNone(results[1])
+                await self.player.disconnect(force=True)
+            self.assert_disconnected(node, cleanup)
+
+    async def test_concurrent_disconnect_shares_teardown(self) -> None:
+        """Concurrent and repeated callers perform one destroy, leave and cleanup."""
+        for cancel_first in (False, True):
+            with self.subTest(cancel_first=cancel_first):
+                await self.assert_disconnect_shares_teardown(cancel_first=cancel_first)
+
     async def test_disconnect_channel_none_reentrancy(self) -> None:
         """channel=None completion must not recursively disconnect/cleanup."""
         node = self.make_owner()

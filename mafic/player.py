@@ -125,6 +125,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
         self._voice_update_lock: Lock = Lock()
         # Terminal for this instance; reconnect creates a new Discord protocol.
         self._disconnect_requested: bool = False
+        self._disconnect_task: asyncio.Task[None] | None = None
 
     def set_state(self, state: PlayerPayload) -> None:
         """Set the state of the player.
@@ -607,15 +608,49 @@ class Player(VoiceProtocol, Generic[ClientT]):
         ----------
         force:
             Whether to force the disconnect even if not connected.
+
+        Notes
+        -----
+        Concurrent calls share one teardown. Once disconnect starts, cancellation
+        is propagated only after teardown completes.
         """
-        if not force and self.guild.voice_client is not self:
-            return
+        task = self._disconnect_task
+        if task is None:
+            if not force and self.guild.voice_client is not self:
+                return
 
-        # Handled by Discord
-        if self.client.is_closed():
-            return
+            # Handled by Discord
+            if self.client.is_closed():
+                return
 
-        self._disconnect_requested = True
+            self._disconnect_requested = True
+            task = self._disconnect_task = asyncio.create_task(self._disconnect_voice())
+
+        # Caller cancellation must not cancel the shared teardown or other waiters.
+        cancelled: asyncio.CancelledError | None = None
+        while True:
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as exc:
+                if task.cancelled():
+                    raise
+                cancelled = exc
+            except Exception:
+                if cancelled is None:
+                    raise
+                _log.exception(
+                    "Failed to disconnect player after caller cancellation.",
+                    extra={"guild": self._guild_id},
+                )
+                break
+            else:
+                break
+
+        if cancelled is not None:
+            raise cancelled
+
+    async def _disconnect_voice(self) -> None:
+        """Finish terminal voice teardown once for all disconnect callers."""
         _log.debug(
             "Disconnecting player and destroying client.",
             extra={"guild": self._guild_id},
@@ -728,7 +763,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
                 pause=snapshot["paused"],
                 filter=snapshot_filter,
             )
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             await self._destroy_partial_target(node)
             raise
 
