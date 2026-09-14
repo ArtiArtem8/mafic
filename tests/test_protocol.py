@@ -1071,6 +1071,122 @@ class NodeTransferTests(IsolatedAsyncioTestCase):
         self.assertIs(self.player._node, old_node)
         self.assertIs(old_node._players[1], self.player)
 
+    async def test_disconnect_uses_adapter_registration_not_connected_flag(
+        self,
+    ) -> None:
+        """Adapter registration, not Lavalink state, decides disconnect work."""
+        node = self.make_node("A")
+        node._players[1] = self.player
+        self.player._node = cast("Node[Client]", node)
+        self.player._connected = False
+        self.guild.voice_client = self.player
+
+        with patch.object(Player, "cleanup", Mock()):
+            await self.player.disconnect()
+
+        node.destroy.assert_awaited_once_with(guild_id=1)
+        self.guild.change_voice_state.assert_awaited_once_with(channel=None)
+        self.assertIsNone(self.player.assigned_node)
+        self.assertFalse(self.player.connected)
+
+    async def test_disconnect_destroy_failure_still_leaves_and_cleans(self) -> None:
+        """A failing node destroy must not skip Discord leave or cleanup."""
+        node = self.make_node("A")
+        node._players[1] = self.player
+        self.player._node = cast("Node[Client]", node)
+        self.guild.voice_client = self.player
+        node.destroy.side_effect = RuntimeError("destroy failed")
+        cleanup = Mock()
+
+        with patch.object(Player, "cleanup", cleanup):
+            async with asyncio.timeout(1):
+                await self.player.disconnect(force=True)
+
+        node.destroy.assert_awaited_once_with(guild_id=1)
+        self.guild.change_voice_state.assert_awaited_once_with(channel=None)
+        cleanup.assert_called_once()
+        self.assertIsNone(self.player.assigned_node)
+        self.assertFalse(self.player.connected)
+
+    async def test_move_to_after_disconnect_fails_fast(self) -> None:
+        """move_to cannot send a gateway request after disconnect starts."""
+        self.player._disconnecting = True
+        self.guild.voice_client = self.player
+
+        with self.assertRaises(PlayerNotConnected):
+            await self.player.move_to(cast("VoiceChannel", self.channel))
+
+        self.guild.change_voice_state.assert_not_awaited()
+
+    async def test_v3_transfer_uses_real_node_update_without_user_data(
+        self,
+    ) -> None:
+        """Lavalink 3.7.13 transfer uses encodedTrack and drops v4 userData."""
+        old_node = make_node(3)
+        old_node._players = {1: self.player}
+        target_node = make_node(3)
+        target_node._players = {}
+        self.player._node = old_node
+        v3_state = {
+            "guildId": "1",
+            "track": "encoded-track",
+            "volume": 55,
+            "paused": False,
+            "state": {
+                "time": 1_000,
+                "position": 333,
+                "connected": True,
+                "ping": 5,
+            },
+            "filters": {},
+        }
+        calls: list[tuple[str, str, object, object]] = []
+
+        async def request(
+            method: str,
+            path: str,
+            json: object = None,
+            params: object = None,
+        ) -> object:
+            calls.append((method, path, json, params))
+            if method == "GET":
+                return v3_state
+            if method == "DELETE":
+                return None
+            if method == "PATCH":
+                data = cast("dict[str, object]", json)
+                if "voice" in data:
+                    return None
+                return v3_state
+            raise AssertionError(method)
+
+        with patch.object(Node, "_Node__request", AsyncMock(side_effect=request)):
+            await self.player.transfer_to(target_node)
+
+        self.assertIs(self.player._node, target_node)
+        self.assertIs(target_node.get_player(1), self.player)
+        self.assertIsNone(old_node.get_player(1))
+        update_calls = [
+            call
+            for call in calls
+            if call[0] == "PATCH"
+            and isinstance(call[2], dict)
+            and "encodedTrack" in call[2]
+        ]
+        self.assertEqual(len(update_calls), 1)
+        payload = cast("dict[str, object]", update_calls[0][2])
+        self.assertEqual(payload["encodedTrack"], "encoded-track")
+        self.assertEqual(payload["position"], 333)
+        self.assertEqual(payload["volume"], 55)
+        self.assertFalse(payload["paused"])
+        self.assertEqual(payload["filters"], {})
+        self.assertNotIn("userData", payload)
+        current = self.player._current
+        if current is None:
+            self.fail("Transfer did not restore the v3 track.")
+        self.assertEqual(current.id, "encoded-track")
+        self.assertEqual(current.user_data, {})
+
     async def test_transfer_restores_lavalink_v3_state(self) -> None:
         """Lavalink v3 encoded track state transfers without v4 parsing."""
         v3_state = cast(

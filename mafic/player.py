@@ -563,6 +563,9 @@ class Player(VoiceProtocol, Generic[ClientT]):
         voice protocol. Disconnect is independent of this queue; an interrupted
         move may time out, and queued moves recheck the protocol registration.
         """
+        if self._disconnecting:
+            raise PlayerNotConnected
+
         if not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
             channel, (VoiceChannel, StageChannel)
         ):
@@ -603,7 +606,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
         force:
             Whether to force the disconnect even if not connected.
         """
-        if not self._connected and not force:
+        if not force and self.guild.voice_client is not self:
             return
 
         # Handled by Discord
@@ -620,6 +623,11 @@ class Player(VoiceProtocol, Generic[ClientT]):
                 self._node.remove_player(self.guild.id)
                 try:
                     await self._node.destroy(guild_id=self.guild.id)
+                except Exception:  # noqa: BLE001 - leave/cleanup must continue
+                    _log.exception(
+                        "Failed to destroy player during disconnect.",
+                        extra={"guild": self.guild.id},
+                    )
                 finally:
                     self._node = None
 
@@ -710,6 +718,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
             else:
                 snapshot_track = shallow_copy(self._current)
                 snapshot_track.id = cast("str", snapshot["track"])
+                snapshot_track.user_data = {}
         else:
             snapshot_track = (
                 Track.from_data_with_info(snapshot["track"])
