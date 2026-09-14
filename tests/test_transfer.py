@@ -640,62 +640,121 @@ class NodeTransferTests(IsolatedAsyncioTestCase):
 
         self.guild.change_voice_state.assert_not_awaited()
 
-    async def test_v3_transfer_uses_real_node_update_without_user_data(
-        self,
+    async def assert_transfer_direction(
+        self, source_version: int, target_version: int
     ) -> None:
-        """Lavalink 3.7.13 transfer uses encodedTrack and drops v4 userData."""
-        old_node = make_node(3)
+        """Exercise source parsing and target serialization through real Node calls."""
+        old_node = make_node(source_version)
+        old_node._session_id = "source-session"
         old_node._players = {1: self.player}
-        target_node = make_node(3)
+        target_node = make_node(target_version)
+        target_node._session_id = "target-session"
         target_node._players = {}
         self.player._node = old_node
-        v3_state = v3_player_payload()
+        source_state = (
+            v3_player_payload() if source_version == 3 else player_payload("server")
+        )
+        source_state["volume"] = 55
+        source_state["state"]["position"] = 333
+        target_state = (
+            v3_player_payload() if target_version == 3 else player_payload("server")
+        )
+        target_state["volume"] = 73
+        target_state["state"]["position"] = 777
+        target_state["paused"] = True
+        if target_version == 4 and source_version == 3:
+            target_track = target_state["track"]
+            if target_track is None:
+                self.fail("Expected target fixture track.")
+            target_track["userData"] = {}
+        local_track = self.player.current
+        if local_track is None:
+            self.fail("Expected local fixture track.")
+        local_track.id = "stale-local-track"
         calls: list[tuple[str, str, object, object]] = []
 
         async def request(
-            method: str,
-            path: str,
-            json: object = None,
-            params: object = None,
+            method: str, path: str, json: object = None, params: object = None
         ) -> object:
             calls.append((method, path, json, params))
             if method == "GET":
-                return v3_state
+                self.assertIn("source-session", path)
+                return source_state
             if method == "DELETE":
+                self.assertIn("source-session", path)
+                self.assertIs(self.player.assigned_node, target_node)
+                self.assertIsNone(old_node.get_player(1))
                 return None
             if method == "PATCH":
-                data = cast("dict[str, object]", json)
-                if "voice" in data:
-                    return None
-                return v3_state
+                self.assertIn("target-session", path)
+                self.assertIs(self.player.assigned_node, old_node)
+                self.assertIsNone(target_node.get_player(1))
+                return target_state
             raise AssertionError(method)
 
         with patch.object(Node, "_Node__request", AsyncMock(side_effect=request)):
             await self.player.transfer_to(target_node)
 
-        self.assertIs(self.player._node, target_node)
-        self.assertIs(target_node.get_player(1), self.player)
-        self.assertIsNone(old_node.get_player(1))
-        update_calls = [
-            call
-            for call in calls
-            if call[0] == "PATCH"
-            and isinstance(call[2], dict)
-            and "encodedTrack" in call[2]
-        ]
-        self.assertEqual(len(update_calls), 1)
-        payload = cast("dict[str, object]", update_calls[0][2])
-        self.assertEqual(payload["encodedTrack"], "encoded-track")
+        self.assertEqual(
+            [call[0] for call in calls], ["GET", "PATCH", "PATCH", "DELETE"]
+        )
+        payload = cast("dict[str, object]", calls[2][2])
+        if target_version == 3:
+            self.assertEqual(payload["encodedTrack"], "encoded-track")
+            self.assertNotIn("track", payload)
+            self.assertNotIn("userData", payload)
+        else:
+            expected_data = {"correlation_id": "server"} if source_version == 4 else {}
+            self.assertEqual(
+                payload["track"],
+                {"encoded": "encoded-track", "userData": expected_data},
+            )
+            self.assertNotIn("encodedTrack", payload)
         self.assertEqual(payload["position"], 333)
         self.assertEqual(payload["volume"], 55)
         self.assertFalse(payload["paused"])
         self.assertEqual(payload["filters"], {})
-        self.assertNotIn("userData", payload)
-        current = self.player._current
+        self.assertIs(self.player.assigned_node, target_node)
+        self.assertIs(target_node.get_player(1), self.player)
+        self.assertIsNone(old_node.get_player(1))
+        current = self.player.current
         if current is None:
-            self.fail("Transfer did not restore the v3 track.")
+            self.fail("Transfer did not restore the track.")
         self.assertEqual(current.id, "encoded-track")
-        self.assertEqual(current.user_data, {})
+        self.assertEqual(
+            current.user_data,
+            (
+                {"correlation_id": "server"}
+                if source_version == target_version == 4
+                else {}
+            ),
+        )
+        self.assertEqual(self.player._position, 777)
+        self.assertEqual(self.player._volume, 73)
+        self.assertTrue(self.player.paused)
+        self.assertEqual(local_track.id, "stale-local-track")
+        self.assertEqual(local_track.user_data, {"correlation_id": "transfer"})
+        if source_version == 4:
+            source_track = source_state["track"]
+            if source_track is None:
+                self.fail("Source fixture lost its track.")
+            self.assertEqual(source_track.get("userData"), {"correlation_id": "server"})
+
+    async def test_v3_transfer_uses_real_node_update_without_user_data(self) -> None:
+        """A v3 source restores to v3 without leaking cached local userData."""
+        await self.assert_transfer_direction(3, 3)
+
+    async def test_v3_to_v4_transfer_uses_real_node_update(self) -> None:
+        """A v3 source sends its encoded track in the v4 track envelope."""
+        await self.assert_transfer_direction(3, 4)
+
+    async def test_v4_to_v3_transfer_uses_real_node_update(self) -> None:
+        """A v4 source is copied without userData for the v3 target."""
+        await self.assert_transfer_direction(4, 3)
+
+    async def test_v4_to_v4_transfer_uses_real_node_update(self) -> None:
+        """A v4 transfer keeps snapshot userData through real serialization."""
+        await self.assert_transfer_direction(4, 4)
 
     async def test_transfer_restores_lavalink_v3_state(self) -> None:
         """Lavalink v3 encoded track state transfers without v4 parsing."""
@@ -797,6 +856,43 @@ class NodeTransferTests(IsolatedAsyncioTestCase):
         self.assertIs(new_node._players[1], self.player)
         new_node.update.assert_awaited_once()
         old_node.destroy.assert_awaited_once_with(guild_id=1)
+
+    async def test_cancelled_committed_cleanup_finishes_before_propagation(
+        self,
+    ) -> None:
+        """Cancellation waits for old destroy and never rolls back committed B."""
+        old_node = self.make_owner()
+        target = self.make_node("B")
+        destroying, release, destroyed = Event(), Event(), Event()
+
+        async def destroy(*, guild_id: int) -> None:
+            self.assertEqual(guild_id, 1)
+            destroying.set()
+            await release.wait()
+            destroyed.set()
+
+        old_node.destroy.side_effect = destroy
+        async with asyncio.timeout(1):
+            transfer = asyncio.create_task(
+                self.player.transfer_to(cast("Node[Client]", target))
+            )
+            await destroying.wait()
+            self.assertIs(self.player.assigned_node, target)
+            self.assertIs(target.get_player(1), self.player)
+            self.assertIsNone(old_node.get_player(1))
+            transfer.cancel()
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await transfer
+
+        self.assertTrue(destroyed.is_set())
+        self.assertIs(self.player.assigned_node, target)
+        self.assertIs(target.get_player(1), self.player)
+        self.assertIsNone(old_node.get_player(1))
+        self.assertFalse(self.player._disconnect_requested)
+        self.assertFalse(self.player._voice_update_lock.locked())
+        old_node.destroy.assert_awaited_once_with(guild_id=1)
+        target.destroy.assert_not_awaited()
 
     async def test_invalid_prerequisites_do_not_mutate_ownership(self) -> None:
         """Missing or invalid voice state leaves the old owner untouched."""

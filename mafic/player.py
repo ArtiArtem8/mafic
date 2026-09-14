@@ -626,6 +626,10 @@ class Player(VoiceProtocol, Generic[ClientT]):
             self._disconnect_requested = True
             task = self._disconnect_task = asyncio.create_task(self._disconnect_voice())
 
+        await self._await_voice_cleanup(task)
+
+    async def _await_voice_cleanup(self, task: asyncio.Task[None]) -> None:
+        """Wait for voice cleanup before propagating caller cancellation."""
         # Caller cancellation must not cancel the shared teardown or other waiters.
         cancelled: asyncio.CancelledError | None = None
         while True:
@@ -639,7 +643,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
                 if cancelled is None:
                     raise
                 _log.exception(
-                    "Failed to disconnect player after caller cancellation.",
+                    "Failed to finish voice cleanup after caller cancellation.",
                     extra={"guild": self._guild_id},
                 )
                 break
@@ -715,6 +719,8 @@ class Player(VoiceProtocol, Generic[ClientT]):
         preparation fails, the old node remains authoritative and its Lavalink
         player is preserved. After a successful commit, failure to destroy the
         old Lavalink player is logged and does not roll back the transfer.
+        Cancellation during old-node cleanup waits for it to finish before
+        propagating. A Lavalink v3 target cannot preserve track user data.
         """
         async with self._voice_update_lock:
             await self._transfer_to_unlocked(node)
@@ -745,6 +751,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
             raise RuntimeError(msg)
 
         snapshot_track = self._track_from_snapshot(snapshot, old_node.version)
+        prepared_track = self._track_for_target(snapshot_track, node.version)
         snapshot_filter = Filter.from_payload(snapshot["filters"])
         labels_match_snapshot = self._merged_filter().payload == snapshot["filters"]
 
@@ -757,7 +764,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
             )
             target_state = await node.update(
                 guild_id=self._guild_id,
-                track=snapshot_track,
+                track=prepared_track,
                 position=snapshot["state"]["position"],
                 volume=snapshot["volume"],
                 pause=snapshot["paused"],
@@ -777,7 +784,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
         old_node.remove_player(self.guild.id)
 
         target_track = (
-            snapshot_track
+            prepared_track
             if node.version == 3
             else self._track_from_snapshot(target_state, node.version)
         )
@@ -787,7 +794,9 @@ class Player(VoiceProtocol, Generic[ClientT]):
 
         # The migration is committed; old cleanup is best-effort.
         try:
-            await old_node.destroy(guild_id=self.guild.id)
+            await self._await_voice_cleanup(
+                asyncio.create_task(old_node.destroy(guild_id=self.guild.id))
+            )
         except Exception:  # noqa: BLE001 - committed migration, cleanup only
             _log.exception(
                 "Failed to destroy old node player after transfer.",
@@ -804,6 +813,15 @@ class Player(VoiceProtocol, Generic[ClientT]):
                 extra={"guild": self.guild.id, "node": node.label},
             )
 
+    @staticmethod
+    def _track_for_target(track: Track | None, target_version: int) -> Track | None:
+        """Adapt a parsed snapshot track to the target without mutating the source."""
+        if track is None or target_version != 3:
+            return track
+        adapted = shallow_copy(track)
+        adapted.user_data = {}
+        return adapted
+
     def _track_from_snapshot(self, state: PlayerPayload, version: int) -> Track | None:
         """Restore the encoded track, using local metadata only for Lavalink v3."""
         if state["track"] is None:
@@ -816,6 +834,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
 
         track = shallow_copy(self._current)
         track.id = cast("str", state["track"])
+        # A v3 snapshot has no user data; cached local values are not authoritative.
         track.user_data = {}
         return track
 
