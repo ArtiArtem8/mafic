@@ -112,6 +112,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
         self._connected: bool = False
         self._position: int = 0
         self._position_received_at = monotonic()
+        self._state_updates = 0
         self._playback_generation = 0
         self._pending_updates = 0
         self._ended_playbacks: set[str] = set()
@@ -145,6 +146,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
         self._playback_generation += 1
         self.endpoint = state["voice"]["endpoint"]
         track = Track.from_data_with_info(state["track"]) if state["track"] else None
+        self._state_updates = 0
         self._sync_playback_state(state, track)
         self._filters = OrderedDict({"RESUME": Filter.from_payload(state["filters"])})
         self._server_state = {
@@ -153,13 +155,22 @@ class Player(VoiceProtocol, Generic[ClientT]):
             "guild_id": self._guild_id,
         }
 
-    def _sync_playback_state(self, state: PlayerPayload, track: Track | None) -> None:
+    def _sync_playback_state(
+        self,
+        state: PlayerPayload,
+        track: Track | None,
+        *,
+        preserve_live_state: bool = False,
+    ) -> None:
         """Apply REST playback state without replacing Discord voice credentials."""
         self._current = track
-        self._position = state["state"]["position"]
-        self._position_received_at = monotonic()
-        self._connected = state["state"]["connected"]
-        self._ping = state["state"]["ping"]
+        if not preserve_live_state:
+            self._position = state["state"]["position"]
+            self._position_received_at = monotonic()
+            self._connected = state["state"]["connected"]
+            self._ping = state["state"]["ping"]
+        elif self._paused and not state["paused"]:
+            self._position_received_at = monotonic()
         self._volume = state["volume"]
         self._paused = state["paused"]
 
@@ -182,9 +193,11 @@ class Player(VoiceProtocol, Generic[ClientT]):
 
     @property
     def reported_position(self) -> int:
-        """The last position received from Lavalink, in milliseconds.
+        """The last accepted server position, in milliseconds.
 
         This read-only value does not extrapolate between server updates.
+        For an active launch, websocket updates take precedence over REST
+        snapshots, which can briefly report a pre-seek audio position.
         """
         return self._position
 
@@ -258,6 +271,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
             self._node_player_ready_event.set()
 
         self._position = state.get("position", 0)
+        self._state_updates += 1
         self._position_received_at = monotonic()
         self._connected = state["connected"]
         self._ping = state.get("ping", -1)
@@ -440,7 +454,9 @@ class Player(VoiceProtocol, Generic[ClientT]):
                 and self._current is current
             ):
                 self._sync_playback_state(
-                    state, self._track_from_snapshot(state, node.version)
+                    state,
+                    self._track_from_snapshot(state, node.version),
+                    preserve_live_state=self._state_updates > 0,
                 )
         except Exception:  # noqa: BLE001 - owned background reconciliation boundary
             _log.warning(
@@ -863,6 +879,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
             if node.version == 3
             else self._track_from_snapshot(target_state, node.version)
         )
+        self._state_updates = 0
         self._sync_playback_state(target_state, target_track)
         if not labels_match_snapshot:
             self._filters = OrderedDict({"RESUME": snapshot_filter})
@@ -1043,6 +1060,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
         self._playback_generation += 1
         generation = self._playback_generation
         self._pending_updates += 1
+        state_updates = self._state_updates
         try:
             data = await node.update(
                 guild_id=self._guild_id,
@@ -1066,7 +1084,18 @@ class Player(VoiceProtocol, Generic[ClientT]):
             # also return the previous launch rather than the requested one.
             if self._playback_id(accepted) in self._ended_playbacks:
                 accepted = None
-            self._sync_playback_state(data, accepted)
+            new_launch = self._playback_id(accepted) != self._playback_id(self._current)
+            if node.version == 3:
+                new_launch = track is not MISSING and track is not None and replace
+            # REST can report the old audio position even after a seek's websocket
+            # update, including in subsequent pause/volume responses. Keep one
+            # live-state authority; REST seeds restoration and new launches only.
+            preserve_live_state = self._state_updates > 0 and (
+                self._state_updates != state_updates or not new_launch
+            )
+            self._sync_playback_state(
+                data, accepted, preserve_live_state=preserve_live_state
+            )
         finally:
             self._pending_updates -= 1
             if not self._pending_updates:

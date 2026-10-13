@@ -161,6 +161,102 @@ class PlayerContracts(IsolatedAsyncioTestCase):
             await self.player.stop()
         self.assertIsNone(self.player.current)
 
+    async def test_seek_websocket_wins_over_rest_and_following_updates(self) -> None:
+        """A pre-seek audio snapshot cannot undo the live position or readiness."""
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def delayed_seek(**_kwargs: object) -> PlayerPayload:
+            entered.set()
+            await release.wait()
+            # Lavalink can emit the seek position before its audio thread moves.
+            response = deepcopy(self.state)
+            response["state"].update(time=3000, position=1320, connected=False)
+            response["paused"] = True
+            return response
+
+        with patch("mafic.player.monotonic", return_value=10) as clock:
+            with patch.object(Node, "update", side_effect=delayed_seek):
+                seek = asyncio.create_task(self.player.seek(5000))
+                await entered.wait()
+                self.player.update_state(
+                    {"time": 2000, "position": 5000, "connected": True, "ping": 5}
+                )
+                release.set()
+                await seek
+            self.assertEqual(self.player.reported_position, 5000)
+            self.assertTrue(self.player.connected)
+            clock.return_value = 100
+            with patch.object(Node, "update", side_effect=self.accepted):
+                await self.player.resume()
+                await self.player.set_volume(10)
+            self.assertEqual(self.player.position, 5000)
+            clock.return_value = 102
+            self.assertEqual(self.player.position, 7000)
+            self.assertEqual(self.player.reported_position, 5000)
+            self.player.update_state(
+                {"time": -100000, "position": 200, "connected": True, "ping": 2}
+            )
+            self.assertEqual(self.player.position, 200)
+
+    async def test_new_launch_seeds_position_when_websocket_is_late(self) -> None:
+        """An earlier launch's live position does not become the new start offset."""
+        self.player.update_state(
+            {"time": 2000, "position": 5000, "connected": True, "ping": 5}
+        )
+        with patch.object(Node, "update", side_effect=self.accepted):
+            await self.player.play("new", start_time=100)
+        self.assertEqual(self.player.reported_position, 100)
+
+    async def test_no_replace_keeps_live_position(self) -> None:
+        """A declined launch cannot replace live state with its REST snapshot."""
+        with patch.object(Node, "update", side_effect=self.accepted):
+            await self.player.play("first")
+            self.player.update_state(
+                {"time": 2000, "position": 5000, "connected": True, "ping": 5}
+            )
+            await self.player.play("second", replace=False)
+        self.assertEqual(self.player.reported_position, 5000)
+
+    async def test_new_launch_preserves_websocket_received_before_rest(self) -> None:
+        """An early player update already belongs to the accepted new launch."""
+
+        async def early_update(
+            *, user_data: Mapping[str, JSONValue], **_kwargs: object
+        ) -> PlayerPayload:
+            response = await self.accepted(user_data=user_data)
+            self.player.update_state(
+                {"time": 2000, "position": 5000, "connected": True, "ping": 5}
+            )
+            return response
+
+        with patch.object(Node, "update", side_effect=early_update):
+            await self.player.play("new")
+        self.assertEqual(self.player.reported_position, 5000)
+
+    async def test_restoration_replaces_previous_live_state(self) -> None:
+        """Explicit restoration seeds a new position and transport snapshot."""
+        self.player.update_state(
+            {"time": 2000, "position": 5000, "connected": True, "ping": 5}
+        )
+        self.state["state"].update(position=100, connected=False)
+        self.player.set_state(self.state)
+        self.assertEqual(self.player.reported_position, 100)
+        self.assertFalse(self.player.connected)
+
+    async def test_pause_and_late_seek_websocket_remain_authoritative(self) -> None:
+        """REST acknowledgement can precede the seek update without freezing it."""
+        self.player.update_state(
+            {"time": 2000, "position": 5000, "connected": True, "ping": 5}
+        )
+        with patch.object(Node, "update", side_effect=self.accepted):
+            await self.player.pause()
+            await self.player.seek(100)
+            self.player.update_state(
+                {"time": 3000, "position": 100, "connected": True, "ping": 5}
+            )
+            await self.player.resume()
+        self.assertEqual(self.player.reported_position, 100)
+
     async def test_restored_untagged_end_confirms_rest_and_respects_generation(
         self,
     ) -> None:

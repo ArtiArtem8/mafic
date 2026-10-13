@@ -2,7 +2,7 @@
 
 October 14, 2026
 
-Changes in `fix/player-state-contracts` through `87224fb`, compared with
+Changes in `fix/player-state-contracts`, compared with
 upstream `ooliver1/mafic:master` at `a8c923f`. The major changes include:
 
 - Updated Lavalink v4 payloads and types for Lavalink 4.2
@@ -19,6 +19,7 @@ upstream `ooliver1/mafic:master` at `a8c923f`. The major changes include:
 - Added `Player.reported_position` for the latest server-reported position
 - Fixed playback position drifting when the system clock changes
 - Fixed playback position advancing while paused, disconnected or without a track
+- Fixed REST snapshots overwriting live playback position after seeking
 - Fixed delayed v4 track-end events clearing a newer playback of the same track
 
   - Each new launch reserves `userData.__mafic_playback_id` for a unique ID

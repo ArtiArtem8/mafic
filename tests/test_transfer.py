@@ -159,7 +159,9 @@ class NodeTransferTests(IsolatedAsyncioTestCase):
         server_state["paused"] = True
         server_state["filters"] = Filter(volume=0.5).payload
         self.player._current = Track.from_data_with_info(track_payload("local"))
-        self.player._position = 1_000
+        self.player.update_state(
+            {"time": 100000, "position": 1000, "connected": False, "ping": -1}
+        )
         self.player._paused = False
         self.player._filters = OrderedDict({"LOCAL": Filter(volume=0.25)})
         self.make_owner(payload=server_state)
@@ -179,7 +181,8 @@ class NodeTransferTests(IsolatedAsyncioTestCase):
         self.assertEqual(restored_filter.payload, server_state["filters"])
         self.assertIsNotNone(self.player._current)
         self.assertEqual(self.player._current.user_data["correlation_id"], "server")
-        self.assertEqual(self.player._position, 25_000)
+        self.assertEqual(self.player.reported_position, 25_000)
+        self.assertTrue(self.player.connected)
         self.assertEqual(self.player._volume, 37)
         self.assertTrue(self.player._paused)
         self.assertFalse(await self.player.has_filter("LOCAL"))

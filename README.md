@@ -88,6 +88,19 @@ are documented in this README and in the related docstrings.
 - `move_to()` confirms the Discord channel transition and the corresponding
   voice-state update. It does not guarantee that a later `VOICE_SERVER_UPDATE`
   has already fully reconnected Lavalink.
+- `connected` reports Lavalink's voice gateway connection. Assigning a transfer
+  target does not guarantee readiness; wait for `connected` on that target.
+- `reported_position` is the last accepted server position in milliseconds.
+  `position` extrapolates from it using a local monotonic clock while connected,
+  playing and unpaused. Live websocket state takes precedence over REST snapshots
+  for the current launch, since a REST response can briefly contain the pre-seek
+  audio position. REST seeds restored players, transfer targets and new launches
+  that have not received a websocket update yet.
+- Every v4 launch reserves `userData.__mafic_playback_id` for a new UUID. Caller
+  metadata is copied, transfers retain the ID, and `noReplace` keeps the launch
+  accepted by Lavalink. Late end events still reach listeners but cannot clear a
+  different launch. Untagged restored players need REST confirmation; v3 does not
+  provide this metadata identity guarantee.
 
 ## Usage
 
