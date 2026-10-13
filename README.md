@@ -1,23 +1,6 @@
 # Mafic
 
-> [!NOTE]
-> This is a maintained fork of [ooliver1/mafic](https://github.com/ooliver1/mafic),
-> focused on compatibility with current Lavalink v4 releases.
->
-> Supports Python 3.12–3.14 and is maintained against current stable
-> discord.py, nextcord, disnake and py-cord (with its `voice` extra).
->
-> Targets Lavalink 4.2.2, with complete v4 track metadata
-> (`pluginInfo` / `userData`) round-tripping, the current Update Player track
-> payload, and related protocol correctness fixes.
->
-> - Public access to the explicitly assigned player node.
-> - Public voice-channel movement without depending on Mafic internals.
-> - Public player transfer between nodes, including mixed Lavalink 3.7 / 4.2
->   transfers.
->
-> Upstream changes are kept separate so fixes can still be contributed back
-> as focused pull requests.
+A typed Lavalink client for discord.py, nextcord, disnake and py-cord.
 
 [![MIT License](https://custom-icon-badges.demolab.com/github/license/artiartem8/mafic?color=845ec2&logo=code-square)](https://github.com/artiartem8/mafic/blob/maintained/lavalink-v4/LICENSE "License File")
 [![Lint Workflow Status](https://custom-icon-badges.demolab.com/github/actions/workflow/status/artiartem8/mafic/lint.yml?label=lint&logo=codescan-checkmark&color=ff738c)](https://github.com/artiartem8/mafic/actions/workflows/lint.yml "Lint Workflow")
@@ -26,7 +9,21 @@
 [![Open PRs](https://custom-icon-badges.demolab.com/github/issues-pr-raw/artiartem8/mafic?logo=git-pull-request&color=ffd55f)](https://github.com/artiartem8/mafic/pulls "Open Pull Requests")
 [![Upstream Documentation](https://img.shields.io/readthedocs/mafic?logo=read%20the%20docs&logoColor=white&color=f9f871)](https://mafic.readthedocs.io/en/latest/ "Upstream Mafic documentation")
 
-A properly typehinted lavalink client for discord.py, nextcord, disnake and py-cord.
+**[Fork changelog](FORK_CHANGELOG.md)** · [Installation](#installation) ·
+[Player lifecycle](#player-lifecycle) · [Usage](#usage) ·
+[Upstream documentation](https://mafic.readthedocs.io/en/latest/)
+
+## Maintained fork
+
+This fork of [ooliver1/mafic](https://github.com/ooliver1/mafic) is maintained on
+`maintained/lavalink-v4`. It supports Python 3.12–3.14 and targets Lavalink 4.2.2,
+while retaining Lavalink 3.7 compatibility. Supported Discord libraries are
+discord.py, nextcord, disnake and py-cord (with its `voice` extra).
+
+The fork adds public node assignment, voice-channel movement and player transfer,
+preserves v4 track metadata, and fixes playback identity and position tracking.
+The **[fork changelog](FORK_CHANGELOG.md)** lists the changes from upstream,
+including the October 14, 2026 player-state update.
 
 ## Installation
 
@@ -53,8 +50,6 @@ pip install "mafic @ git+https://github.com/artiartem8/mafic.git@<commit-sha>"
 
 ## Documentation
 
-See the [fork changelog](FORK_CHANGELOG.md) for changes from upstream Mafic.
-
 [Upstream documentation](https://mafic.readthedocs.io/en/latest/) covers the shared
 Mafic API. The fork-specific player lifecycle API and its Lavalink 4.2 behavior
 are documented in this README and in the related docstrings.
@@ -71,6 +66,8 @@ are documented in this README and in the related docstrings.
   disnake and py-cord adapters.
 
 ## Player lifecycle
+
+### Node ownership and voice readiness
 
 - `Player.assigned_node` returns the Lavalink node currently assigned to the
   player, or `None` when no node is assigned. Unlike `Player.node`, it never
@@ -90,17 +87,23 @@ are documented in this README and in the related docstrings.
   has already fully reconnected Lavalink.
 - `connected` reports Lavalink's voice gateway connection. Assigning a transfer
   target does not guarantee readiness; wait for `connected` on that target.
-- `reported_position` is the last accepted server position in milliseconds.
-  `position` extrapolates from it using a local monotonic clock while connected,
-  playing and unpaused. Live websocket state takes precedence over REST snapshots
-  for the current launch, since a REST response can briefly contain the pre-seek
-  audio position. REST seeds restored players, transfer targets and new launches
-  that have not received a websocket update yet.
-- Every v4 launch reserves `userData.__mafic_playback_id` for a new UUID. Caller
-  metadata is copied, transfers retain the ID, and `noReplace` keeps the launch
-  accepted by Lavalink. Late end events still reach listeners but cannot clear a
-  different launch. Untagged restored players need REST confirmation; v3 does not
-  provide this metadata identity guarantee.
+
+### Playback position
+
+`reported_position` is the last accepted server position in milliseconds.
+`position` extrapolates from it using a local monotonic clock while connected,
+playing and unpaused. Live websocket state takes precedence over REST snapshots
+for the current launch, since a REST response can briefly contain the pre-seek
+audio position. REST seeds restored players, transfer targets and new launches
+that have not received a websocket update yet.
+
+### Playback identity
+
+Every v4 launch reserves `userData.__mafic_playback_id` for a new UUID. Caller
+metadata is copied, transfers retain the ID, and `noReplace` keeps the launch
+accepted by Lavalink. Late end events still reach listeners but cannot clear a
+different launch. Untagged restored players need REST confirmation; v3 does not
+provide this metadata identity guarantee.
 
 ## Usage
 
