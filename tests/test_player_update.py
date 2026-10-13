@@ -6,8 +6,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, TypedDict, cast
 from unittest import IsolatedAsyncioTestCase
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
+from mafic.__libraries import Client, Guild, VoiceChannel
 from mafic.node import Node
 from mafic.player import Player
 from mafic.track import Track
@@ -17,7 +18,6 @@ from .test_track import track_payload
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-    from mafic.__libraries import Client
     from mafic.typings import JSONValue, Player as PlayerPayload, UpdatePlayerPayload
 
 
@@ -59,6 +59,17 @@ def make_node(version: int) -> Node[Client]:
     node._session_id = "lavalink-session"
     node._label = "TEST"
     return node
+
+
+def make_player() -> Player[Client]:
+    """Construct a real connected player for behavioral tests."""
+    guild = Mock(spec=Guild, id=1)
+    channel = Mock(spec=VoiceChannel, id=10, guild=guild)
+    client = Mock(spec=Client)
+    client.is_closed.return_value = False
+    player: Player[Client] = Player(client, channel, node=make_node(4))
+    player._connected = True
+    return player
 
 
 class NodePlayerUpdateTests(IsolatedAsyncioTestCase):
@@ -177,7 +188,7 @@ class PlayerPlayTests(IsolatedAsyncioTestCase):
     async def test_play_sends_track_user_data(self) -> None:
         """Player.play preserves Track.user_data by default."""
         node = make_node(4)
-        player: Player[Client] = cast("Player[Client]", object.__new__(Player))
+        player = make_player()
         player._node = node
         player._connected = True
         player._guild_id = 1
@@ -189,6 +200,9 @@ class PlayerPlayTests(IsolatedAsyncioTestCase):
         if request.await_args is None:
             self.fail("Player did not make an update request.")
         payload = request.await_args.args[2]
+        self.assertIsInstance(
+            payload["track"]["userData"].pop("__mafic_playback_id"), str
+        )
         self.assertEqual(
             payload,
             {
@@ -202,7 +216,7 @@ class PlayerPlayTests(IsolatedAsyncioTestCase):
     async def test_play_forwards_explicit_user_data(self) -> None:
         """Player.play forwards an explicit user data object."""
         node = make_node(4)
-        player: Player[Client] = cast("Player[Client]", object.__new__(Player))
+        player = make_player()
         player._node = node
         player._connected = True
         player._guild_id = 1
@@ -214,6 +228,9 @@ class PlayerPlayTests(IsolatedAsyncioTestCase):
         if request.await_args is None:
             self.fail("Player did not make an update request.")
         payload = request.await_args.args[2]
+        self.assertIsInstance(
+            payload["track"]["userData"].pop("__mafic_playback_id"), str
+        )
         self.assertEqual(
             payload,
             {
@@ -231,7 +248,7 @@ class PlayerPlayTests(IsolatedAsyncioTestCase):
     async def test_play_can_clear_track_user_data(self) -> None:
         """An explicit empty object replaces a Track's existing metadata."""
         node = make_node(4)
-        player: Player[Client] = cast("Player[Client]", object.__new__(Player))
+        player = make_player()
         player._node = node
         player._connected = True
         player._guild_id = 1
@@ -246,6 +263,10 @@ class PlayerPlayTests(IsolatedAsyncioTestCase):
 
         if request.await_args is None:
             self.fail("Player did not make an update request.")
+        self.assertIsInstance(
+            request.await_args.args[2]["track"]["userData"].pop("__mafic_playback_id"),
+            str,
+        )
         self.assertEqual(
             request.await_args.args[2],
             {"track": {"encoded": "encoded-track", "userData": {}}},

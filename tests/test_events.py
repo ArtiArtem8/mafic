@@ -10,10 +10,9 @@ from unittest import TestCase
 from unittest.mock import Mock
 
 from mafic.errors import TrackLoadException
-from mafic.player import Player
 from mafic.track import Track
 
-from .test_player_update import make_node
+from .test_player_update import make_node, make_player
 from .test_track import track_payload
 
 if TYPE_CHECKING:
@@ -24,6 +23,7 @@ if TYPE_CHECKING:
         TrackStartEvent,
         TrackStuckEvent,
     )
+    from mafic.player import Player
     from mafic.typings import EventPayload, LavalinkException
 
     TrackEvent = Union[
@@ -40,10 +40,11 @@ class TrackEventMetadataTests(TestCase):
     def setUp(self) -> None:
         """Build a minimal connected v4 player."""
         self.dispatch = Mock()
-        self.player: Player[Client] = cast("Player[Client]", object.__new__(Player))
+        self.player = make_player()
         self.player._node = make_node(4)
         self.player.client = cast("Client", SimpleNamespace(dispatch=self.dispatch))
         self.player._current = Track.from_data_with_info(track_payload("current"))
+        self.player._current.user_data["__mafic_playback_id"] = "current-id"
         self.player._last_track = self.player._current
 
     def dispatch_track_event(self, payload: EventPayload) -> TrackEvent:

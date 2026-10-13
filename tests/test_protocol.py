@@ -24,7 +24,7 @@ from mafic.pool import NodePool
 from mafic.stats import CPUStats
 from mafic.warnings import UnsupportedVersionWarning
 
-from .test_player_update import make_node, player_payload
+from .test_player_update import make_node, make_player, player_payload
 
 if TYPE_CHECKING:
     from mafic.__libraries import (
@@ -47,7 +47,7 @@ class PlayerStateTests(TestCase):
 
     def test_unassigned_node_is_none_without_selecting_fallback(self) -> None:
         """Inspecting an unassigned player never consults the pool."""
-        player: Player[Client] = cast("Player[Client]", object.__new__(Player))
+        player = make_player()
         player._node = None
 
         with patch.object(NodePool, "get_random_node") as fallback:
@@ -57,7 +57,7 @@ class PlayerStateTests(TestCase):
 
     def test_assigned_node_returns_current_assignment(self) -> None:
         """Both node properties return the exact assigned node."""
-        player: Player[Client] = cast("Player[Client]", object.__new__(Player))
+        player = make_player()
         node = make_node(4)
         player._node = node
 
@@ -71,7 +71,7 @@ class PlayerStateTests(TestCase):
 
     def test_node_fallback_does_not_assign_node(self) -> None:
         """The existing node fallback leaves the player unassigned."""
-        player: Player[Client] = cast("Player[Client]", object.__new__(Player))
+        player = make_player()
         player._node = None
         player._guild_id = 1
         node = make_node(4)
@@ -84,7 +84,7 @@ class PlayerStateTests(TestCase):
 
     def test_set_state_reads_player_state_and_track_metadata(self) -> None:
         """Sync/resume reconstruction keeps state and complete track metadata."""
-        player: Player[Client] = cast("Player[Client]", object.__new__(Player))
+        player = make_player()
         player._guild_id = 1
 
         player.set_state(player_payload("resumed"))
@@ -278,6 +278,41 @@ class NodeProtocolTests(IsolatedAsyncioTestCase):
 
 class VoiceStateTests(IsolatedAsyncioTestCase):
     """Verify Discord voice state changes reach Lavalink."""
+
+    async def test_initial_callbacks_preserve_explicit_node_in_either_order(
+        self,
+    ) -> None:
+        """Initial selection never transfers away from the constructor's node."""
+        for server_first in (False, True):
+            with self.subTest(server_first=server_first):
+                node = make_node(4)
+                self.player = Player(self.player.client, self.channel, node=node)
+                server: VoiceServerUpdatePayload = {
+                    "guild_id": 1,
+                    "endpoint": "voice.example.com",
+                    "token": "token",
+                }
+                with (
+                    patch.object(
+                        NodePool,
+                        "get_node",
+                        side_effect=AssertionError("Unexpected selection"),
+                    ),
+                    patch.object(Node, "add_player"),
+                    patch.object(
+                        Node, "voice_update", new_callable=AsyncMock
+                    ) as update,
+                    patch.object(Node, "fetch_player", new_callable=AsyncMock) as fetch,
+                ):
+                    if server_first:
+                        await self.player.on_voice_server_update(server)
+                        await self.voice_state_update(10)
+                    else:
+                        await self.voice_state_update(10)
+                        await self.player.on_voice_server_update(server)
+                self.assertIs(self.player.assigned_node, node)
+                update.assert_awaited_once()
+                fetch.assert_not_awaited()
 
     def setUp(self) -> None:
         """Build a connected player using the selected adapter's channel types."""

@@ -117,6 +117,12 @@ class NodeTransferTests(IsolatedAsyncioTestCase):
     async def test_transfer_prepares_target_before_commit(self) -> None:
         """Target voice/state is prepared before ownership moves from A to B."""
         server_state = player_payload("server")
+        if server_state["track"] is None:
+            self.fail("Expected transfer track")
+        server_state["track"]["userData"] = {
+            "correlation_id": "server",
+            "__mafic_playback_id": "same-launch",
+        }
         old_node = self.make_owner(payload=server_state)
         new_node = self.make_node("B", payload=server_state)
 
@@ -138,6 +144,7 @@ class NodeTransferTests(IsolatedAsyncioTestCase):
         update_kwargs = new_node.update.await_args.kwargs
         transferred = cast("Track", update_kwargs["track"])
         self.assertEqual(transferred.user_data["correlation_id"], "server")
+        self.assertEqual(transferred.user_data["__mafic_playback_id"], "same-launch")
         self.assertEqual(update_kwargs["position"], server_state["state"]["position"])
         self.assertEqual(update_kwargs["volume"], server_state["volume"])
         self.assertIs(update_kwargs["pause"], server_state["paused"])

@@ -11,8 +11,9 @@ from collections import OrderedDict
 from copy import copy as shallow_copy
 from functools import reduce
 from logging import getLogger
-from time import time
+from time import monotonic
 from typing import TYPE_CHECKING, Generic, cast
+from uuid import uuid4
 
 from .__libraries import (
     MISSING,
@@ -110,6 +111,11 @@ class Player(VoiceProtocol, Generic[ClientT]):
         self._connected: bool = False
         self._position: int = 0
         self._last_update: int = 0
+        self._position_received_at = monotonic()
+        self._playback_generation = 0
+        self._pending_updates = 0
+        self._ended_playbacks: set[str] = set()
+        self._end_confirmation: asyncio.Task[None] | None = None
         self._ping = -1
         self._current: Track | None = None
         self._filters: OrderedDict[str, Filter] = OrderedDict()
@@ -136,6 +142,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
             You should not need to use this.
         """
         self._session_id = state["voice"]["sessionId"]
+        self._playback_generation += 1
         self.endpoint = state["voice"]["endpoint"]
         track = Track.from_data_with_info(state["track"]) if state["track"] else None
         self._sync_playback_state(state, track)
@@ -151,6 +158,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
         self._current = track
         self._last_update = state["state"]["time"]
         self._position = state["state"]["position"]
+        self._position_received_at = monotonic()
         self._connected = state["state"]["connected"]
         self._ping = state["state"]["ping"]
         self._volume = state["volume"]
@@ -170,19 +178,28 @@ class Player(VoiceProtocol, Generic[ClientT]):
 
     @property
     def connected(self) -> bool:
-        """Whether the player is connected to a voice channel."""
+        """Whether Lavalink reports a connection to the Discord voice gateway."""
         return self._connected
+
+    @property
+    def reported_position(self) -> int:
+        """The last position received from Lavalink, in milliseconds.
+
+        This read-only value does not extrapolate between server updates.
+        """
+        return self._position
 
     @property
     def position(self) -> int:
         """The current position of the player in milliseconds."""
         pos = self._position
 
-        if self._connected and self._current is not None:
+        if self._connected and self._current is not None and not self._paused:
             # Add the time since the last update to the position.
             # If the track total time is less than that, use that.
             pos = min(
-                self._current.length, pos + int((time() * 1000) - self._last_update)
+                self._current.length,
+                pos + max(0, int((monotonic() - self._position_received_at) * 1000)),
             )
 
         return pos
@@ -243,6 +260,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
 
         self._last_update = state["time"]
         self._position = state.get("position", 0)
+        self._position_received_at = monotonic()
         self._connected = state["connected"]
         self._ping = state.get("ping", -1)
 
@@ -339,8 +357,9 @@ class Player(VoiceProtocol, Generic[ClientT]):
             self.client.dispatch("track_end", event)
             _log.debug("Received track end event: %s", event)
 
-            if data["reason"] not in ("REPLACED", "replaced"):
-                self._current = None
+            self._end_playback(
+                track, replaced=data["reason"] in ("REPLACED", "replaced")
+            )
         elif data["type"] == "TrackExceptionEvent":
             track = (
                 self._current
@@ -380,6 +399,56 @@ class Player(VoiceProtocol, Generic[ClientT]):
 
             event_type = cast(str, data["type"])
             _log.warning("Unknown incoming event type %s", event_type)
+
+    @staticmethod
+    def _playback_id(track: Track | None) -> str | None:
+        """Read the reserved v4 launch identity without relying on encoded audio."""
+        value = track.user_data.get("__mafic_playback_id") if track else None
+        return value if isinstance(value, str) else None
+
+    def _end_playback(self, track: Track, *, replaced: bool) -> None:
+        """Clear only the ended launch; confirm untagged restored state via REST."""
+        ended = self._playback_id(track)
+        if ended is not None and self._pending_updates:
+            self._ended_playbacks.add(ended)
+        if replaced:
+            return
+        if self.node.version == 3:
+            self._current = None
+            return
+        current = self._playback_id(self._current)
+        if current is not None:
+            if current == ended:
+                self._current = None
+        elif (
+            self._current is not None
+            and not self._disconnect_requested
+            and (self._end_confirmation is None or self._end_confirmation.done())
+        ):
+            self._end_confirmation = asyncio.create_task(
+                self._confirm_end(self.node, self._playback_generation, self._current)
+            )
+
+    async def _confirm_end(
+        self, node: Node[ClientT], generation: int, current: Track
+    ) -> None:
+        """Resolve ambiguous restored playback without overwriting a newer owner."""
+        try:
+            state = await node.fetch_player(self._guild_id)
+            if (
+                self._node is node
+                and not self._disconnect_requested
+                and self._playback_generation == generation
+                and self._current is current
+            ):
+                self._sync_playback_state(
+                    state, self._track_from_snapshot(state, node.version)
+                )
+        except Exception:  # noqa: BLE001 - owned background reconciliation boundary
+            _log.warning(
+                "Unable to confirm ambiguous track end for guild %s", self._guild_id
+            )
+            _log.debug("Track end confirmation traceback", exc_info=True)
 
     async def on_voice_state_update(  # pyright: ignore[reportIncompatibleMethodOverride]
         self, data: GuildVoiceStatePayload
@@ -437,10 +506,9 @@ class Player(VoiceProtocol, Generic[ClientT]):
                 return
 
             current_node = self._node
-            if (
-                current_node is None
-                or self._server_state is None
-                or self._server_state["endpoint"] != data["endpoint"]
+            if current_node is None or (
+                self._server_state is not None
+                and self._server_state["endpoint"] != data["endpoint"]
             ):
                 _log.debug(
                     "Getting best node for player", extra={"guild": self._guild_id}
@@ -624,6 +692,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
                 return
 
             self._disconnect_requested = True
+            self._connected = False
             task = self._disconnect_task = asyncio.create_task(self._disconnect_voice())
 
         await self._await_voice_cleanup(task)
@@ -655,6 +724,9 @@ class Player(VoiceProtocol, Generic[ClientT]):
 
     async def _disconnect_voice(self) -> None:
         """Finish terminal voice teardown once for all disconnect callers."""
+        if self._end_confirmation is not None:
+            self._end_confirmation.cancel()
+            await asyncio.gather(self._end_confirmation, return_exceptions=True)
         _log.debug(
             "Disconnecting player and destroying client.",
             extra={"guild": self._guild_id},
@@ -690,6 +762,8 @@ class Player(VoiceProtocol, Generic[ClientT]):
         """
         self._current = None
         self._position = 0
+        self._position_received_at = monotonic()
+        self._playback_generation += 1
         self._paused = False
         self._ping = 0
         self._connected = False
@@ -721,6 +795,8 @@ class Player(VoiceProtocol, Generic[ClientT]):
         old Lavalink player is logged and does not roll back the transfer.
         Cancellation during old-node cleanup waits for it to finish before
         propagating. A Lavalink v3 target cannot preserve track user data.
+        Ownership transfer preserves v4 playback identity but does not promise
+        voice readiness: wait for :attr:`connected` on the assigned target.
         """
         async with self._voice_update_lock:
             await self._transfer_to_unlocked(node)
@@ -781,6 +857,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
         # Register only after preparation so target events cannot mutate the owner.
         node.add_player(self.guild.id, self)
         self._node = node
+        self._playback_generation += 1
         old_node.remove_player(self.guild.id)
 
         target_track = (
@@ -921,7 +998,9 @@ class Player(VoiceProtocol, Generic[ClientT]):
             JSON-compatible data to associate with the track. When omitted for a
             :class:`Track`, its existing :attr:`Track.user_data` is preserved.
 
-            This is only supported by Lavalink v4.
+            This is only supported by Lavalink v4. Each new launch overwrites
+            the reserved ``__mafic_playback_id`` field with a fresh UUID.
+            Caller mappings are not mutated; transfers preserve the launch ID.
 
         Raises
         ------
@@ -942,7 +1021,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
 
         # v4+ receives the full payload in events, so there is no need to
         # pre-emptyively update the player.
-        if track is not None and self.node.version == 3:
+        if track is not MISSING and track is not None and self.node.version == 3:
             if isinstance(track, str):
                 message = (
                     "Lavalink version 3 does not support identifiers "
@@ -952,23 +1031,47 @@ class Player(VoiceProtocol, Generic[ClientT]):
 
             self._current = track
 
-        data = await self._node.update(
-            guild_id=self._guild_id,
-            track=track,
-            position=position,
-            end_time=end_time,
-            volume=volume,
-            pause=pause,
-            filter=filter,
-            no_replace=not replace,
-            user_data=user_data,
-        )
+        node = self._node
+        if node.version != 3 and track is not MISSING and track is not None:
+            metadata = dict(
+                user_data
+                if user_data is not MISSING
+                else track.user_data if isinstance(track, Track) else {}
+            )
+            metadata["__mafic_playback_id"] = str(uuid4())
+            user_data = metadata
 
-        if data["track"]:
-            self._current = Track.from_data_with_info(data["track"])
-
-        self._volume = data["volume"]
-        self._paused = data["paused"]
+        self._playback_generation += 1
+        generation = self._playback_generation
+        self._pending_updates += 1
+        try:
+            data = await node.update(
+                guild_id=self._guild_id,
+                track=track,
+                position=position,
+                end_time=end_time,
+                volume=volume,
+                pause=pause,
+                filter=filter,
+                no_replace=not replace,
+                user_data=user_data,
+            )
+            if (
+                self._node is not node
+                or self._disconnect_requested
+                or self._playback_generation != generation
+            ):
+                return
+            accepted = self._track_from_snapshot(data, node.version)
+            # An end event can arrive before this REST response. noReplace may
+            # also return the previous launch rather than the requested one.
+            if self._playback_id(accepted) in self._ended_playbacks:
+                accepted = None
+            self._sync_playback_state(data, accepted)
+        finally:
+            self._pending_updates -= 1
+            if not self._pending_updates:
+                self._ended_playbacks.clear()
 
     async def play(
         self,
@@ -1006,7 +1109,9 @@ class Player(VoiceProtocol, Generic[ClientT]):
             JSON-compatible data to associate with the track. When omitted, the
             :attr:`Track.user_data` from a :class:`Track` is used.
 
-            This is only supported by Lavalink v4.
+            This is only supported by Lavalink v4. Each new launch overwrites
+            the reserved ``__mafic_playback_id`` field with a fresh UUID.
+            Caller mappings are not mutated; transfers preserve the launch ID.
 
         Raises
         ------
