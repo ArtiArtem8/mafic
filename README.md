@@ -53,6 +53,8 @@ pip install "mafic @ git+https://github.com/artiartem8/mafic.git@<commit-sha>"
 
 ## Documentation
 
+See the [fork changelog](FORK_CHANGELOG.md) for changes from upstream Mafic.
+
 [Upstream documentation](https://mafic.readthedocs.io/en/latest/) covers the shared
 Mafic API. The fork-specific player lifecycle API and its Lavalink 4.2 behavior
 are documented in this README and in the related docstrings.
