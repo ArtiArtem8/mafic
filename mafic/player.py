@@ -52,6 +52,7 @@ if TYPE_CHECKING:
 
 _log = getLogger(__name__)
 __all__ = ("Player",)
+_PLAYBACK_ID_KEY = "__mafic_playback_id"
 
 
 class Player(VoiceProtocol, Generic[ClientT]):
@@ -110,7 +111,6 @@ class Player(VoiceProtocol, Generic[ClientT]):
         self._server_state: VoiceServerUpdatePayload | None = None
         self._connected: bool = False
         self._position: int = 0
-        self._last_update: int = 0
         self._position_received_at = monotonic()
         self._playback_generation = 0
         self._pending_updates = 0
@@ -156,7 +156,6 @@ class Player(VoiceProtocol, Generic[ClientT]):
     def _sync_playback_state(self, state: PlayerPayload, track: Track | None) -> None:
         """Apply REST playback state without replacing Discord voice credentials."""
         self._current = track
-        self._last_update = state["state"]["time"]
         self._position = state["state"]["position"]
         self._position_received_at = monotonic()
         self._connected = state["state"]["connected"]
@@ -258,7 +257,6 @@ class Player(VoiceProtocol, Generic[ClientT]):
         if not self._node_player_ready_event.is_set():
             self._node_player_ready_event.set()
 
-        self._last_update = state["time"]
         self._position = state.get("position", 0)
         self._position_received_at = monotonic()
         self._connected = state["connected"]
@@ -403,7 +401,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
     @staticmethod
     def _playback_id(track: Track | None) -> str | None:
         """Read the reserved v4 launch identity without relying on encoded audio."""
-        value = track.user_data.get("__mafic_playback_id") if track else None
+        value = track.user_data.get(_PLAYBACK_ID_KEY) if track else None
         return value if isinstance(value, str) else None
 
     def _end_playback(self, track: Track, *, replaced: bool) -> None:
@@ -1033,12 +1031,13 @@ class Player(VoiceProtocol, Generic[ClientT]):
 
         node = self._node
         if node.version != 3 and track is not MISSING and track is not None:
-            metadata = dict(
-                user_data
-                if user_data is not MISSING
-                else track.user_data if isinstance(track, Track) else {}
-            )
-            metadata["__mafic_playback_id"] = str(uuid4())
+            if user_data is not MISSING:
+                metadata = dict(user_data)
+            elif isinstance(track, Track):
+                metadata = dict(track.user_data)
+            else:
+                metadata = {}
+            metadata[_PLAYBACK_ID_KEY] = str(uuid4())
             user_data = metadata
 
         self._playback_generation += 1

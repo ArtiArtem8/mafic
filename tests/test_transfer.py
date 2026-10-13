@@ -7,7 +7,6 @@ from __future__ import annotations
 import asyncio
 from asyncio import Event
 from collections import OrderedDict
-from time import time
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 from unittest import IsolatedAsyncioTestCase
@@ -74,7 +73,6 @@ class NodeTransferTests(IsolatedAsyncioTestCase):
         self.player._connected = True
         self.player._current = Track.from_data_with_info(track_payload("transfer"))
         self.player._position = 250
-        self.player._last_update = int(time() * 1_000)
 
     def make_node(
         self, label: str, *, payload: PlayerPayload | None = None, version: int = 4
@@ -162,7 +160,6 @@ class NodeTransferTests(IsolatedAsyncioTestCase):
         server_state["filters"] = Filter(volume=0.5).payload
         self.player._current = Track.from_data_with_info(track_payload("local"))
         self.player._position = 1_000
-        self.player._last_update = int(time() * 1_000)
         self.player._paused = False
         self.player._filters = OrderedDict({"LOCAL": Filter(volume=0.25)})
         self.make_owner(payload=server_state)
