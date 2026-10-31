@@ -5,6 +5,16 @@ Changes in `maintained/lavalink-v4` since upstream
 Dates follow Git history. Related code, test and documentation commits are grouped
 into one entry, with links to the original changes.
 
+## November 1, 2026
+
+[Changes](https://github.com/ArtiArtem8/mafic/compare/23de661...818a0c8)
+
+- Fixed a closed or failed websocket leaving the node available with its old session
+- Fixed connection attempts continuing without a socket and publishing ready early
+- Retried transient handshake failures; other handshake errors now reach the caller
+- Made `close()` cancel and join listener, message and reconnect tasks
+- Added node lifecycle regression tests
+
 ## October 14, 2026
 
 [Changes](https://github.com/ArtiArtem8/mafic/compare/87224fb...96dfa48)
