@@ -8,9 +8,17 @@ from __future__ import annotations
 
 import re
 import warnings
-from asyncio import Event, TimeoutError, create_task, gather, sleep, wait_for
+from asyncio import (
+    FIRST_COMPLETED,
+    Event,
+    create_task,
+    current_task,
+    gather,
+    sleep,
+    wait,
+    wait_for,
+)
 from logging import getLogger
-from traceback import print_exc
 from typing import TYPE_CHECKING, Generic, cast
 
 import aiohttp
@@ -586,6 +594,15 @@ class Node(Generic[ClientT]):
     ) -> None:
         """Connect to the node.
 
+        Transient websocket failures (network errors, timeouts, HTTP 429/5xx)
+        are retried with backoff. Other handshake errors propagate to the caller.
+        This call waits until ready and player synchronization complete, or it
+        fails/is cancelled.
+        Call :meth:`close` to stop a pending connection or reconnect.
+        The node's ``timeout`` is not an overall retry deadline. Callers needing
+        a bounded attempt can use :func:`asyncio.timeout` and close the node
+        after failure.
+
         Parameters
         ----------
         backoff:
@@ -598,14 +615,48 @@ class Node(Generic[ClientT]):
         Raises
         ------
         NodeAlreadyConnected
-            If the node is already connected.
+            If the node is already connected or connecting.
         asyncio.TimeoutError
             If the connection times out.
             You can change the timeout with the `timeout` parameter.
         """
-        if self._ws is not None:
+        if (
+            self._ws is not None
+            or (self._connect_task is not None and not self._connect_task.done())
+            or (self._ws_task is not None and not self._ws_task.done())
+        ):
             raise NodeAlreadyConnected
 
+        await self._start_connect(backoff=backoff, player_cls=player_cls)
+
+    def _start_connect(
+        self,
+        *,
+        backoff: ExponentialBackoff[Literal[False]] | None,
+        player_cls: type[Player[ClientT]] | None,
+    ) -> Task[None]:
+        task = create_task(self._connect(backoff=backoff, player_cls=player_cls))
+        self._connect_task = task
+
+        def done(task: Task[None]) -> None:
+            if self._connect_task is task:
+                self._connect_task = None
+            if not task.cancelled() and (error := task.exception()) is not None:
+                _log.error(
+                    "Node connection failed.",
+                    exc_info=error,
+                    extra={"label": self._label},
+                )
+
+        task.add_done_callback(done)
+        return task
+
+    async def _connect(
+        self,
+        *,
+        backoff: ExponentialBackoff[Literal[False]] | None,
+        player_cls: type[Player[ClientT]] | None,
+    ) -> None:
         _log.info("Waiting for client to be ready...", extra={"label": self._label})
         await self._client.wait_until_ready()
         if self._client.user is None:
@@ -632,66 +683,96 @@ class Node(Generic[ClientT]):
         else:
             headers["Session-Id"] = self._resuming_session_id
 
-        _log.info(
-            "Connecting to lavalink at %s...",
-            self._rest_uri,
-            extra={"label": self._label},
-        )
+        backoff = backoff or ExponentialBackoff()
         try:
-            await self._connect_to_websocket(headers=headers, session=session)
-        except Exception as e:  # noqa: BLE001
-            _log.error(
-                "Failed to connect to lavalink at %s: %s",
-                self._rest_uri,
-                e,
-                extra={"label": self._label},
-            )
-            print_exc()
+            while True:
+                try:
+                    await self._connect_to_websocket(headers=headers, session=session)
+                except Exception as error:
+                    if isinstance(error, aiohttp.ClientResponseError):
+                        if error.status != 429 and not 500 <= error.status < 600:
+                            raise
+                    elif isinstance(
+                        error,
+                        (aiohttp.ClientSSLError, aiohttp.ServerFingerprintMismatch),
+                    ) or not isinstance(
+                        error,
+                        (
+                            aiohttp.ClientConnectionError,
+                            aiohttp.ClientPayloadError,
+                            TimeoutError,
+                        ),
+                    ):
+                        raise
+                    delay = backoff.delay()
+                    _log.exception(
+                        "Failed to connect to lavalink at %s. Retrying in %.2fs",
+                        self._rest_uri,
+                        delay,
+                        extra={"label": self._label},
+                    )
+                    await sleep(delay)
+                    continue
 
-            backoff = backoff or ExponentialBackoff()
-            delay = backoff.delay()
-            _log.info(
-                "Retrying connection to lavalink at %s in %s seconds...",
-                self._rest_uri,
-                delay,
-                extra={"label": self._label},
-            )
-            await sleep(delay)
+                _log.info("Connected to lavalink.", extra={"label": self._label})
+                ws = self._ws
+                listener = self._ws_task = create_task(
+                    self._ws_listener(player_cls=player_cls),
+                    name=f"mafic node {self._label}",
+                )
+                ready = create_task(self._wait_until_ready(player_cls=player_cls))
+                try:
+                    await wait((ready, listener), return_when=FIRST_COMPLETED)
+                    # A ready packet alone does not make a disconnected node usable.
+                    if not listener.done() and ws is not None and not ws.closed:
+                        await ready
+                finally:
+                    ready.cancel()
+                    await gather(ready, return_exceptions=True)
 
-            task = create_task(self.connect(backoff=backoff))
-            self._connect_task = task
-
-            def remove_task(_: Task[None]) -> None:
-                self._connect_task = None
-
-            task.add_done_callback(remove_task)
-
-        _log.info("Connected to lavalink.", extra={"label": self._label})
-
-        _log.debug(
-            "Creating task for websocket listener...", extra={"label": self._label}
-        )
-        self._ws_task = create_task(
-            self._ws_listener(), name=f"mafic node {self._label}"
-        )
-
-        try:
-            _log.debug("Waiting for ready", extra={"label": self._label})
-            await wait_for(self._ready.wait(), timeout=self._timeout)
-        except TimeoutError:
-            _log.error(
-                "Timed out waiting for node to become ready.",
-                extra={"label": self._label},
-            )
+                # No awaits between this last transport check and publishing ready.
+                if (
+                    listener.done()
+                    or ws is None
+                    or ws.closed
+                    or not self._ready.is_set()
+                ):
+                    await listener
+                    await sleep(backoff.delay())
+                    continue
+                self._event_queue.set()
+                self._available = True
+                self._client.dispatch("node_ready", self)
+                return
+        except BaseException:
+            # Also clean up on caller cancellation or a ready/sync failure.
+            await self._disconnect()
             raise
-        else:
-            _log.info(
-                "Node %s is now available.", self._label, extra={"label": self._label}
-            )
-            await self.sync_players(player_cls=player_cls)
-            self._event_queue.set()
-            self._available = True
-            self._client.dispatch("node_ready", self)
+
+    async def _wait_until_ready(
+        self, *, player_cls: type[Player[ClientT]] | None
+    ) -> None:
+        await wait_for(self._ready.wait(), timeout=self._timeout)
+        await self.sync_players(player_cls=player_cls)
+
+    async def _disconnect(self) -> None:
+        """Stop socket work before closing its transport."""
+        self._available = False
+        self._ready.clear()
+        self._event_queue.clear()
+        tasks = set(self._msg_tasks)
+        if self._ws_task is not None:
+            tasks.add(self._ws_task)
+        if (current := current_task()) is not None:
+            tasks.discard(current)
+        for task in tasks:
+            task.cancel()
+        # On external shutdown, join the listener even if it was already inside
+        # _disconnect. Its cleanup must stop before we take over socket closure.
+        await gather(*tasks, return_exceptions=True)
+        if self._ws is not None:
+            await self._ws.close()
+            self._ws = None
 
     async def close(self) -> None:
         """Close the node.
@@ -700,33 +781,15 @@ class Node(Generic[ClientT]):
 
         .. versionadded:: 2.6
         """
-        if self._ws is not None:
-            _log.debug("Closing websocket.", extra={"label": self._label})
-            await self._ws.close()
-            self._ws = None
-            _log.debug("Websocket closed.", extra={"label": self._label})
+        self._available = False
+        if self._connect_task is not None:
+            self._connect_task.cancel()
+            await gather(self._connect_task, return_exceptions=True)
+        await self._disconnect()
 
         if self.__session is not None:
-            _log.debug("Closing session.", extra={"label": self._label})
             await self.__session.close()
             self.__session = None
-            _log.debug("Session closed.", extra={"label": self._label})
-
-        if self._ws_task is not None:
-            _log.debug(
-                "Cancelling websocket listener task.", extra={"label": self._label}
-            )
-            self._ws_task.cancel()
-            self._ws_task = None
-            _log.debug(
-                "Websocket listener task cancelled.", extra={"label": self._label}
-            )
-
-        if self._connect_task is not None:
-            _log.debug("Cancelling connection task.", extra={"label": self._label})
-            self._connect_task.cancel()
-            self._connect_task = None
-            _log.debug("Connection task cancelled.", extra={"label": self._label})
 
         _log.info("Node %s is now closed.", self._label, extra={"label": self._label})
         self.cleanup()
@@ -741,62 +804,54 @@ class Node(Generic[ClientT]):
         self._ready.clear()
         self._event_queue.clear()
 
-    async def _ws_listener(self) -> None:
-        """Listen for messages from the websocket."""
-        backoff = ExponentialBackoff()
-
-        if self._ws is None:
-            _log.error(
-                "No websocket was found, aborting listener.",
-                extra={"label": self._label},
-            )
+    async def _ws_listener(
+        self, *, player_cls: type[Player[ClientT]] | None = None
+    ) -> None:
+        """Listen for text payloads and recover from transport loss."""
+        ws = self._ws
+        if ws is None:
             msg = "Websocket is not connected but attempted to listen, report this."
             raise RuntimeError(msg)
 
-        # To catch closing messages, we cannot use async for.
-        while True:
-            msg = await self._ws.receive()
+        try:
+            # async iteration hides the close/error frames we need to handle.
+            while True:
+                msg = await ws.receive()
+                if msg.type in (
+                    aiohttp.WSMsgType.CLOSE,
+                    aiohttp.WSMsgType.CLOSING,
+                    aiohttp.WSMsgType.CLOSED,
+                    aiohttp.WSMsgType.ERROR,
+                ):
+                    break
+                if msg.type is aiohttp.WSMsgType.TEXT:
+                    task = create_task(self._handle_msg(msg.json(loads=loads)))
+                    self._msg_tasks.add(task)
+                    task.add_done_callback(self._msg_tasks.discard)
+        except Exception:  # noqa: BLE001
+            _log.exception("Websocket listener failed.", extra={"label": self._label})
 
-            _log.debug("Received message from websocket.", extra={"label": self._label})
+        # Cancellation deliberately bypasses recovery (Node.close owns shutdown).
+        self._available = False
+        self._ready.clear()
+        self._event_queue.clear()
+        self._client.dispatch("node_unavailable", self)
+        await self._disconnect()
 
-            # Please aiohttp, fix your typehints.
-            _type: aiohttp.WSMsgType = msg.type  # pyright: ignore  # noqa: PGH003
+        # A pending connect already owns retries until ready + sync completes.
+        if self._connect_task is not None and not self._connect_task.done():
+            return
 
-            if _type is aiohttp.WSMsgType.CLOSED:
-                self._available = False
-                self._client.dispatch("node_unavailable", self)
-                close_code = self._ws.close_code
-                self._ready.clear()
-                self._ws = None
-
-                wait_time = backoff.delay()
-                _log.warning(
-                    "Websocket was closed from host %s port %s with RFC 6455 code %s. "
-                    "Reconnecting in %.2fs",
-                    self._host,
-                    self._port,
-                    close_code,
-                    wait_time,
-                    extra={"label": self._label},
-                )
-
-                await sleep(wait_time)
-                task = create_task(self.connect(backoff=backoff))
-                self._connect_task = task
-
-                def remove_task(_: Task[None]) -> None:
-                    self._connect_task = None
-
-                task.add_done_callback(remove_task)
-                return
-            else:
-                _log.debug(
-                    "Creating task to handle websocket message.",
-                    extra={"label": self._label},
-                )
-                task = create_task(self._handle_msg(msg.json(loads=loads)))
-                self._msg_tasks.add(task)
-                task.add_done_callback(self._msg_tasks.discard)
+        backoff = ExponentialBackoff()
+        delay = backoff.delay()
+        _log.warning(
+            "Websocket closed with code %s. Reconnecting in %.2fs",
+            ws.close_code,
+            delay,
+            extra={"label": self._label},
+        )
+        await sleep(delay)
+        self._start_connect(backoff=backoff, player_cls=player_cls)
 
     async def _handle_msg(self, data: IncomingMessage) -> None:
         """Handle a message from the websocket.
