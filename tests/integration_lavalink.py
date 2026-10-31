@@ -51,6 +51,7 @@ class MaficLavalinkIntegrationTests(IsolatedAsyncioTestCase):
         node._ws = None
         node._ws_task = None
         node._connect_task = None
+        node._msg_tasks = set()
         node._ready = Event()
         node._event_queue = Event()
         object.__setattr__(node, "_Node__password", INTEGRATION_PASSWORD)
