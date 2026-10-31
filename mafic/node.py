@@ -755,11 +755,15 @@ class Node(Generic[ClientT]):
         await wait_for(self._ready.wait(), timeout=self._timeout)
         await self.sync_players(player_cls=player_cls)
 
-    async def _disconnect(self) -> None:
-        """Stop socket work before closing its transport."""
+    def _mark_unavailable(self) -> None:
+        """Clear availability and readiness before listeners are notified."""
         self._available = False
         self._ready.clear()
         self._event_queue.clear()
+
+    async def _disconnect(self) -> None:
+        """Stop socket work before closing its transport."""
+        self._mark_unavailable()
         tasks = set(self._msg_tasks)
         if self._ws_task is not None:
             tasks.add(self._ws_task)
@@ -781,7 +785,7 @@ class Node(Generic[ClientT]):
 
         .. versionadded:: 2.6
         """
-        self._available = False
+        self._mark_unavailable()
         if self._connect_task is not None:
             self._connect_task.cancel()
             await gather(self._connect_task, return_exceptions=True)
@@ -796,13 +800,11 @@ class Node(Generic[ClientT]):
 
     def cleanup(self) -> None:
         """Cleanup the node, as if it was never connected."""
-        self._available = False
+        self._mark_unavailable()
         self._ws = None
         self._ws_task = None
         self._connect_task = None
         self.__session = None
-        self._ready.clear()
-        self._event_queue.clear()
 
     async def _ws_listener(
         self, *, player_cls: type[Player[ClientT]] | None = None
@@ -832,9 +834,7 @@ class Node(Generic[ClientT]):
             _log.exception("Websocket listener failed.", extra={"label": self._label})
 
         # Cancellation deliberately bypasses recovery (Node.close owns shutdown).
-        self._available = False
-        self._ready.clear()
-        self._event_queue.clear()
+        self._mark_unavailable()
         self._client.dispatch("node_unavailable", self)
         await self._disconnect()
 
