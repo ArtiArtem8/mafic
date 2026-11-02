@@ -21,14 +21,22 @@ if TYPE_CHECKING:
     from mafic.typings import Player as PlayerPayload
 
 
+class RestoreGuild(FakeGuild):
+    """Guild double that also carries the bot member's voice state."""
+
+    def __init__(self, client: FakeClient) -> None:
+        super().__init__(client)
+        self.me: object = SimpleNamespace(voice=SimpleNamespace(channel=None))
+
+
 class RestoreClient(FakeClient):
     """A client that can resolve the guild being restored."""
 
-    def __init__(self, guild: FakeGuild) -> None:
+    def __init__(self, guild: RestoreGuild) -> None:
         super().__init__()
         self._guild = guild
 
-    def get_guild(self, _guild_id: int) -> FakeGuild:
+    def get_guild(self, _guild_id: int) -> RestoreGuild:
         """Return the fake guild for the restored player."""
         return self._guild
 
@@ -51,11 +59,9 @@ class RestorationTests(IsolatedAsyncioTestCase):
 
         self.channel: Mock = Mock(spec=VoiceChannel, id=CHANNEL_ID)
         self.channel._get_voice_client_key.return_value = (GUILD_ID, None)
-        self.guild = FakeGuild(FakeClient())
+        self.guild = RestoreGuild(FakeClient())
         self.channel.guild = self.guild
-        self.guild.me = SimpleNamespace(  # pyright: ignore[reportAttributeAccessIssue]
-            voice=SimpleNamespace(channel=self.channel)
-        )
+        self.guild.me = SimpleNamespace(voice=SimpleNamespace(channel=self.channel))
         self.client = RestoreClient(self.guild)
         # Rebind the guild to the client that owns the cache under test.
         self.guild._connection = self.client._connection

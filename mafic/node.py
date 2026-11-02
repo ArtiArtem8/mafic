@@ -1610,7 +1610,8 @@ class Node(Generic[ClientT]):
         # Circular, pool -> node -> player -> pool
         from .player import Player
 
-        player = (cls or Player)(self.client, channel)
+        player_cls: type[Player[ClientT]] = cls or Player
+        player = player_cls(self.client, channel)
 
         # Never write the Discord cache slot unconditionally. An occupant here
         # is a protocol mafic did not create, and evicting it would strand a
