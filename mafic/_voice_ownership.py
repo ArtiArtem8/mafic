@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import TYPE_CHECKING
-from weakref import WeakKeyDictionary
+from weakref import WeakKeyDictionary, ref
 
 if TYPE_CHECKING:
     from asyncio import Lock
@@ -34,19 +34,30 @@ class GuildVoiceCoordinator:
     lock that a Discord callback needs to acquire. A teardown that waited on a
     callback which itself needed the lane would deadlock. The lock order is
     therefore always lane-before-Player-lock, never the reverse.
+
+    The owner is held through a weak reference. A strong one would make the
+    registry value keep its own key alive: coordinator -> Player -> client,
+    where the client is the weak key, so no entry would ever be collected.
+    A live owner is always strongly reachable from the Discord voice-client
+    cache or from Node._players, so the weak reference cannot drop an owner
+    that still matters.
     """
 
-    __slots__ = ("_epoch", "_lane", "_owner")
+    # __weakref__ lets callers observe when a coordinator is released without
+    # keeping it alive; the registry itself never depends on that hook.
+    __slots__ = ("__weakref__", "_epoch", "_lane", "_owner")
 
     def __init__(self) -> None:
         self._lane: Lock = asyncio.Lock()
-        self._owner: object | None = None
+        self._owner: ref[object] | None = None
         self._epoch = 0
 
     @property
     def owner(self) -> object | None:
-        """The player currently authorised to speak for this guild."""
-        return self._owner
+        """Return the player currently authorised to speak for this guild."""
+        if self._owner is None:
+            return None
+        return self._owner()
 
     @property
     def epoch(self) -> int:
@@ -67,12 +78,12 @@ class GuildVoiceCoordinator:
         merely slow.
         """
         self._epoch += 1
-        self._owner = player
+        self._owner = ref(player)
         return self._epoch
 
     def release(self, player: object) -> None:
         """Drop ownership only when the caller still holds it."""
-        if self._owner is player:
+        if self.owner is player:
             self._owner = None
 
     def is_current(self, player: object, epoch: int | None = None) -> bool:
@@ -81,7 +92,7 @@ class GuildVoiceCoordinator:
         The epoch argument distinguishes one owner from itself before and after
         a re-claim, which identity alone cannot do.
         """
-        if self._owner is not player:
+        if self.owner is not player:
             return False
         return epoch is None or self._epoch == epoch
 
