@@ -12,7 +12,6 @@ from os import getenv
 from typing import Any, cast
 from unittest import IsolatedAsyncioTestCase, skipUnless
 
-from aiohttp import ClientTimeout
 from yarl import URL
 
 INTEGRATION_URL = getenv("LAVALINK_INTEGRATION_URL")
@@ -59,7 +58,7 @@ class MaficLavalinkIntegrationTests(IsolatedAsyncioTestCase):
         node._close_task = None
         node._transport_lock = Lock()
         node._owns_session = True
-        node._http_timeout = ClientTimeout(total=300)
+        node._http_timeout = None
         object.__setattr__(node, "_Node__password", INTEGRATION_PASSWORD)
         object.__setattr__(node, "_Node__session", None)
         self.node = node

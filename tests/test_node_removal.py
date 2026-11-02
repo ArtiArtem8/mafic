@@ -25,6 +25,7 @@ class FakeNode:
         self._players: dict[int, Player[Client]] = {}
         self.connect = AsyncMock()
         self.close = AsyncMock()
+        self.destroy = AsyncMock()
 
     @property
     def players(self) -> list[Player[Client]]:
@@ -226,6 +227,56 @@ class NodeRemovalTests(IsolatedAsyncioTestCase):
         self.assertIs(player.guild.voice_client, replacement)
         self.node.close.assert_awaited_once()
 
+    async def test_started_disconnect_does_not_touch_replacement_voice_client(
+        self,
+    ) -> None:
+        """A replacement installed while disconnect waits on its lock survives."""
+        guild = Mock(spec=Guild, id=1)
+        guild.change_voice_state = AsyncMock()
+        channel = Mock(spec=VoiceChannel, id=10, guild=guild)
+        channel._get_voice_client_key.return_value = (1, 0)
+        cast("Any", self.client)._connection = Mock()
+        old = Player(
+            self.client,
+            cast("VoiceChannel", channel),
+            node=cast("Node[Client]", self.node),
+        )
+        new = Player(
+            self.client,
+            cast("VoiceChannel", channel),
+            node=cast("Node[Client]", self.node),
+        )
+        for player in (old, new):
+            player._session_id = "discord-session"
+            player._server_state = {
+                "guild_id": 1,
+                "endpoint": "voice.example.com",
+                "token": "token",
+            }
+            player._connected = True
+        self.node.add_player(1, old)
+        self.node.add_player(1, new)
+        guild.voice_client = new
+
+        await old._voice_update_lock.acquire()
+        disconnect = asyncio.create_task(old.disconnect(force=True))
+        await asyncio.sleep(0)
+        try:
+            guild.voice_client = new
+            self.node.add_player(1, new)
+        finally:
+            old._voice_update_lock.release()
+
+        with patch("mafic.player.VoiceProtocol.cleanup") as adapter_cleanup:
+            await asyncio.wait_for(disconnect, 2)
+        adapter_cleanup.assert_not_called()
+        self.assertIs(self.node.get_player(1), new)
+        self.node.destroy.assert_not_awaited()
+        guild.change_voice_state.assert_not_awaited()
+        self.assertIs(guild.voice_client, new)
+        self.assertIsNone(old.assigned_node)
+        self.assertFalse(old.connected)
+
     async def test_late_old_removal_does_not_remove_replacement(self) -> None:
         """A delayed removal must pop only the node instance it owns."""
         old = FakeNode("A")
@@ -302,6 +353,18 @@ class NodeRemovalTests(IsolatedAsyncioTestCase):
         )
 
         self.assertIs(self.node.get_player(1), replacement)
+
+    async def test_removal_forgets_exact_player_after_lost_assignment(self) -> None:
+        """A stale local entry is removed even when the player lost its node."""
+        player = self.make_player(1, self.node)
+        player._node = None
+
+        await self.pool._disconnect_player(
+            cast("Node[Client]", self.node),
+            player,
+        )
+
+        self.assertIsNone(self.node.get_player(1))
 
     async def test_transfer_skips_player_that_left_source(self) -> None:
         """Removal must not transfer a player that already changed ownership."""

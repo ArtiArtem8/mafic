@@ -58,6 +58,7 @@ def make_node(version: int) -> Node[Client]:
     node._version = version
     node._session_id = "lavalink-session"
     node._label = "TEST"
+    node._players = {}
     return node
 
 

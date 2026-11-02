@@ -151,8 +151,9 @@ class Node(Generic[ClientT]):
         error.
     http_timeout: :data:`~typing.Optional`\[:class:`aiohttp.ClientTimeout`]
         The timeout applied to internally created HTTP sessions. ``None`` uses
-        aiohttp's default total timeout. Pass ``ClientTimeout(total=None)`` to
-        disable request timeouts explicitly. Ignored when ``session`` is supplied.
+        aiohttp's session defaults, including its 300 second total and 30 second
+        socket-connect deadlines. Pass ``ClientTimeout(total=None)`` to disable
+        the total request timeout explicitly. Ignored when ``session`` is supplied.
     session: :data:`~typing.Optional`\[:class:`aiohttp.ClientSession`]
         The session to use for the node.
         If not provided, a new session will be created.
@@ -251,9 +252,7 @@ class Node(Generic[ClientT]):
         self._secure = secure
         self._heartbeat = heartbeat
         self._timeout = timeout
-        self._http_timeout = (
-            aiohttp.ClientTimeout(total=300) if http_timeout is None else http_timeout
-        )
+        self._http_timeout = http_timeout
         self._client = client
         self.__session = session
         self._owns_session = session is None
@@ -1271,6 +1270,8 @@ class Node(Generic[ClientT]):
 
     async def _create_session(self) -> aiohttp.ClientSession:
         """Create a new session for the node."""
+        if self._http_timeout is None:
+            return aiohttp.ClientSession(json_serialize=dumps)
         return aiohttp.ClientSession(
             json_serialize=dumps,
             timeout=self._http_timeout,

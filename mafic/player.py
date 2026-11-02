@@ -768,8 +768,20 @@ class Player(VoiceProtocol, Generic[ClientT]):
         )
         async with self._voice_update_lock:
             node = self._node
+            voice_client = self.guild.voice_client
+            owns_voice = voice_client is self or voice_client is None
+            remote_player = node.get_player(self.guild.id) if node is not None else None
+            owns_remote = node is None or remote_player is self or remote_player is None
+            if not (owns_voice and owns_remote):
+                if node is not None and node.get_player(self.guild.id) is self:
+                    node.remove_player(self.guild.id)
+                self._node = None
+                self._cleanup_local_state()
+                return
+
             if node is not None:
-                node.remove_player(self.guild.id)
+                if node.get_player(self.guild.id) is self:
+                    node.remove_player(self.guild.id)
                 try:
                     await node.destroy(guild_id=self.guild.id)
                 except Exception:  # noqa: BLE001 - leave/cleanup must continue
@@ -780,6 +792,11 @@ class Player(VoiceProtocol, Generic[ClientT]):
                 finally:
                     self._node = None
 
+            voice_client = self.guild.voice_client
+            if voice_client is not self and voice_client is not None:
+                self._cleanup_local_state()
+                return
+
             try:
                 _log.debug(
                     "Disconnecting from voice channel.",
@@ -788,13 +805,9 @@ class Player(VoiceProtocol, Generic[ClientT]):
                 await self.guild.change_voice_state(channel=None)
             finally:
                 self.cleanup()
-                self._connected = False
 
-    def cleanup(self) -> None:
-        """Clean up the player.
-
-        This shouldn't be called directly. Instead, use :meth:`disconnect`.
-        """
+    def _cleanup_local_state(self) -> None:
+        """Clear player state without removing a replacement Discord adapter."""
         self._current = None
         self._position = 0
         self._position_received_at = monotonic()
@@ -803,6 +816,12 @@ class Player(VoiceProtocol, Generic[ClientT]):
         self._ping = 0
         self._connected = False
 
+    def cleanup(self) -> None:
+        """Clean up the player.
+
+        This shouldn't be called directly. Instead, use :meth:`disconnect`.
+        """
+        self._cleanup_local_state()
         return super().cleanup()
 
     async def transfer_to(

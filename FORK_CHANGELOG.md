@@ -8,8 +8,8 @@ into one entry, with links to the original changes.
 ## November 3, 2026
 
 - Added configurable `http_timeout` for internally created node sessions
-  - `None` keeps aiohttp's 300 second total deadline
-  - `ClientTimeout(total=None)` explicitly disables it
+  - `None` keeps aiohttp's real session defaults (`total=300`, `sock_connect=30`)
+  - `ClientTimeout(total=None)` explicitly disables the total deadline
   - A caller-supplied session remains caller-owned and is not closed by the node
 - Made `Node.close()` a single owned operation
   - Repeated and cancelled callers share one teardown
@@ -28,8 +28,11 @@ into one entry, with links to the original changes.
 - Added `Player.disconnect_started` and `Player.wait_for_disconnect()`
 - Added `Player.transfer_to(expected_source=...)`, which returns `False` when
   the source node no longer owns the player
+- A player replaced while disconnect waits on its ownership lock keeps its new
+  node mapping and Discord adapter
 - Added regression tests for hung REST teardown, cancellation, concurrent removal,
-  node replacement, ownership races, external sessions and lifecycle task ownership
+  node replacement, ownership races, external sessions, replacement voice clients
+  and lifecycle task ownership
 
 ## November 1, 2026
 

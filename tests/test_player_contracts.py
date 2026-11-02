@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 from unittest import IsolatedAsyncioTestCase
 from unittest.mock import AsyncMock, Mock, patch
 from uuid import UUID
@@ -291,6 +291,7 @@ class PlayerContracts(IsolatedAsyncioTestCase):
     async def test_disconnect_cancels_owned_confirmation(self) -> None:
         """Disconnect joins its ambiguous-end check before tearing down voice."""
         entered = asyncio.Event()
+        cast("Any", self.player.guild).voice_client = self.player
 
         async def fetch(_guild_id: int) -> PlayerPayload:
             entered.set()

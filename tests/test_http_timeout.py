@@ -30,15 +30,18 @@ class HttpTimeoutTests(IsolatedAsyncioTestCase):
             http_timeout=timeout,
         )
 
-    async def test_none_uses_aiohttp_default(self) -> None:
-        """None selects aiohttp's bounded default rather than disabling it."""
+    async def test_none_uses_aiohttp_session_defaults(self) -> None:
+        """None leaves aiohttp's real defaults, including sock_connect=30."""
         node = self.make_node()
-        self.assertEqual(node._http_timeout, aiohttp.ClientTimeout(total=300))
-        self.assertEqual(node._http_timeout.total, 300)
+        self.assertIsNone(node._http_timeout)
 
         session = await node._create_session()
         try:
             self.assertEqual(session.timeout.total, 300)
+            self.assertIsNone(session.timeout.connect)
+            self.assertEqual(session.timeout.sock_connect, 30)
+            self.assertIsNone(session.timeout.sock_read)
+            self.assertEqual(session.timeout.ceil_threshold, 5)
         finally:
             await session.close()
 
@@ -61,7 +64,7 @@ class HttpTimeoutTests(IsolatedAsyncioTestCase):
         timeout = aiohttp.ClientTimeout(total=None)
         node = self.make_node(timeout)
         self.assertIs(node._http_timeout, timeout)
-        self.assertIsNone(node._http_timeout.total)
+        self.assertIsNone(timeout.total)
 
         session = await node._create_session()
         try:

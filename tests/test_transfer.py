@@ -317,6 +317,7 @@ class NodeTransferTests(IsolatedAsyncioTestCase):
     async def test_disconnect_clears_assignment(self) -> None:
         """Disconnect is terminal for the current Player instance."""
         node = self.make_owner()
+        self.guild.voice_client = self.player
 
         with patch("mafic.player.VoiceProtocol.cleanup"):
             await self.player.disconnect(force=True)
@@ -517,6 +518,7 @@ class NodeTransferTests(IsolatedAsyncioTestCase):
     async def test_disconnect_channel_none_reentrancy(self) -> None:
         """channel=None completion must not recursively disconnect/cleanup."""
         node = self.make_owner()
+        self.guild.voice_client = self.player
         payload = cast(
             "GuildVoiceStatePayload",
             {

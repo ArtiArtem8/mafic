@@ -137,8 +137,8 @@ class NodePool(Generic[ClientT]):
             The timeout to use for the node websocket connection.
         http_timeout: :data:`~typing.Optional`\[:class:`aiohttp.ClientTimeout`]
             The timeout applied to internally created HTTP sessions. ``None``
-            uses aiohttp's default total timeout. Ignored when ``session`` is
-            supplied.
+            uses aiohttp's session defaults, including ``sock_connect=30``.
+            Ignored when ``session`` is supplied.
         session: :data:`~typing.Optional`\[:class:`aiohttp.ClientSession`]
             The session to use for the node websocket connection.
             The caller retains ownership of a supplied session.
@@ -355,10 +355,7 @@ class NodePool(Generic[ClientT]):
                 return
             await player.disconnect(force=True)
         finally:
-            if (
-                player.assigned_node is node
-                and node.get_player(player.guild.id) is player
-            ):
+            if node.get_player(player.guild.id) is player:
                 node.remove_player(player.guild.id)
 
     @staticmethod

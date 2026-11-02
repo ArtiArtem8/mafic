@@ -777,11 +777,16 @@ class NodeLifecycleTests(IsolatedAsyncioTestCase):
         self.addAsyncCleanup(node.close)
         await node.connect()
 
+        request = asyncio.create_task(node.fetch_player(1))
         try:
+            done, _ = await asyncio.wait({request}, timeout=2)
+            self.assertTrue(done, "HTTP request did not settle")
             with self.assertRaises(TimeoutError):
-                await asyncio.wait_for(node.fetch_player(1), 2)
+                await request
             self.assertTrue(self.hang_started.is_set())
         finally:
+            request.cancel()
+            await asyncio.gather(request, return_exceptions=True)
             self.release_hang.set()
 
         await node.close()
