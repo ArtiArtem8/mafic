@@ -17,13 +17,19 @@ into one entry, with links to the original changes.
   - A planned close cannot publish another unavailable event or reconnect
   - The node may be connected again after close completes
 - Made `NodePool.remove_node()` all-settled and cancellation-safe
-  - Concurrent removals of one label share one operation
+  - Concurrent removals of one node instance share one operation
+  - A replacement registered under the same label is a distinct node
   - A successful transfer is preserved; a failed transfer cleans only its source
+  - A player that already left the source is not transferred again
+  - Local removal matches the exact player, not only its guild id
   - A replaced Discord voice client is never disconnected
-  - Every started player teardown finishes before the node closes
+  - Source-owned player teardown finishes before the node closes; teardown
+    owned by another node is not awaited
 - Added `Player.disconnect_started` and `Player.wait_for_disconnect()`
+- Added `Player.transfer_to(expected_source=...)`, which returns `False` when
+  the source node no longer owns the player
 - Added regression tests for hung REST teardown, cancellation, concurrent removal,
-  external sessions and lifecycle task ownership
+  node replacement, ownership races, external sessions and lifecycle task ownership
 
 ## November 1, 2026
 

@@ -23,12 +23,17 @@ class FakeNode:
     def __init__(self, label: str) -> None:
         self.label = label
         self._players: dict[int, Player[Client]] = {}
+        self.connect = AsyncMock()
         self.close = AsyncMock()
 
     @property
     def players(self) -> list[Player[Client]]:
         """Return the node's players in pool-removal order."""
         return list(self._players.values())
+
+    def get_player(self, guild_id: int) -> Player[Client] | None:
+        """Return the player currently registered for the guild."""
+        return self._players.get(guild_id)
 
     def add_player(self, guild_id: int, player: Player[Client]) -> None:
         """Register one player for the guild."""
@@ -172,10 +177,14 @@ class NodeRemovalTests(IsolatedAsyncioTestCase):
         transferred = self.make_player(1, self.node)
         failed = self.make_player(2, self.node)
 
-        async def transfer(target: Node[Client]) -> None:
+        async def transfer(
+            target: Node[Client], *, expected_source: Node[Client] | None = None
+        ) -> bool:
+            self.assertIs(expected_source, cast("Node[Client]", self.node))
             transferred._node = target
             cast("FakeNode", target).add_player(transferred.guild.id, transferred)
             self.node.remove_player(transferred.guild.id)
+            return True
 
         failed_transfer = AsyncMock(side_effect=RuntimeError("target unavailable"))
         transferred_disconnect = AsyncMock()
@@ -216,6 +225,181 @@ class NodeRemovalTests(IsolatedAsyncioTestCase):
         change_voice_state.assert_not_awaited()
         self.assertIs(player.guild.voice_client, replacement)
         self.node.close.assert_awaited_once()
+
+    async def test_late_old_removal_does_not_remove_replacement(self) -> None:
+        """A delayed removal must pop only the node instance it owns."""
+        old = FakeNode("A")
+        replacement = FakeNode("A")
+        self.nodes["A"] = cast("Node[Client]", old)
+
+        removal = asyncio.create_task(
+            self.pool.remove_node(cast("Node[Client]", old), transfer_players=False)
+        )
+        # Register the replacement before the removal task gets its first turn.
+        self.nodes["A"] = cast("Node[Client]", replacement)
+        await removal
+
+        self.assertIs(self.nodes["A"], replacement)
+        old.close.assert_awaited_once()
+        replacement.close.assert_not_awaited()
+
+        await self.pool.remove_node(
+            cast("Node[Client]", replacement), transfer_players=False
+        )
+        self.assertNotIn("A", self.nodes)
+        replacement.close.assert_awaited_once()
+
+    async def test_replacement_can_be_removed_during_old_removal(self) -> None:
+        """A replacement node has its own removal, not the old node's task."""
+        old_player = self.make_player(1, self.node)
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def disconnect(*, force: bool) -> None:
+            self.assertTrue(force)
+            started.set()
+            await release.wait()
+
+        old_player.disconnect = AsyncMock(side_effect=disconnect)
+        old_removal = asyncio.create_task(
+            self.pool.remove_node(
+                cast("Node[Client]", self.node), transfer_players=False
+            )
+        )
+        await asyncio.wait_for(started.wait(), 2)
+
+        replacement = FakeNode("A")
+        await self.pool.add_node(cast("Node[Client]", replacement))
+        replacement_removal = asyncio.create_task(
+            self.pool.remove_node(
+                cast("Node[Client]", replacement), transfer_players=False
+            )
+        )
+        try:
+            await asyncio.sleep(0.1)
+            replacement.close.assert_awaited_once()
+        finally:
+            release.set()
+            await old_removal
+            await asyncio.gather(replacement_removal, return_exceptions=True)
+
+        self.node.close.assert_awaited_once()
+        self.assertNotIn("A", self.nodes)
+
+    async def test_disconnect_does_not_remove_replacement_player(self) -> None:
+        """Local removal must match the exact player, not only the guild id."""
+        old = self.make_player(1, self.node)
+        replacement = self.make_player(1, self.node)
+        self.node._players[1] = old
+
+        async def disconnect(*, force: bool) -> None:
+            self.assertTrue(force)
+            self.node._players[1] = replacement
+
+        old.disconnect = AsyncMock(side_effect=disconnect)
+        await self.pool._disconnect_player(
+            cast("Node[Client]", self.node),
+            old,
+        )
+
+        self.assertIs(self.node.get_player(1), replacement)
+
+    async def test_transfer_skips_player_that_left_source(self) -> None:
+        """Removal must not transfer a player that already changed ownership."""
+        player = self.make_player(1, self.node)
+        other = FakeNode("C")
+        player._node = cast("Node[Client]", other)
+        player.transfer_to = AsyncMock()
+        player.disconnect = AsyncMock()
+
+        with patch.object(
+            NodePool,
+            "get_node",
+            return_value=cast("Node[Client]", self.target),
+        ):
+            await self.pool._transfer_players(
+                cast("Node[Client]", self.node),
+                (player,),
+            )
+
+        player.transfer_to.assert_not_awaited()
+        player.disconnect.assert_not_awaited()
+
+    async def test_transfer_waiting_on_lock_returns_false_after_owner_change(
+        self,
+    ) -> None:
+        """Expected-source checking happens under the player ownership lock."""
+        player = self.make_player(1, self.node)
+        source = player.assigned_node
+        other = FakeNode("C")
+
+        await player._voice_update_lock.acquire()
+        transfer = asyncio.create_task(
+            player.transfer_to(
+                cast("Node[Client]", self.target),
+                expected_source=source,
+            )
+        )
+        await asyncio.sleep(0)
+        player._node = cast("Node[Client]", other)
+        player._voice_update_lock.release()
+
+        self.assertFalse(await transfer)
+        self.assertIs(player.assigned_node, cast("Node[Client]", other))
+
+    async def test_removal_does_not_wait_for_player_owned_by_another_node(
+        self,
+    ) -> None:
+        """A started teardown on a different node is not this removal's work."""
+        player = self.make_player(1, self.node)
+        other = FakeNode("C")
+        player._node = cast("Node[Client]", other)
+        release = asyncio.Event()
+
+        async def teardown() -> None:
+            await release.wait()
+
+        teardown_task = asyncio.create_task(teardown())
+        player._disconnect_task = teardown_task
+        removal = asyncio.create_task(
+            self.pool._disconnect_player(
+                cast("Node[Client]", self.node),
+                player,
+            )
+        )
+        try:
+            await asyncio.sleep(0.1)
+            self.assertTrue(removal.done())
+        finally:
+            release.set()
+            await removal
+            await teardown_task
+
+        self.assertIsNone(self.node.get_player(1))
+
+    async def test_removal_waits_for_source_owned_started_teardown(self) -> None:
+        """A teardown still owned by the source node is awaited."""
+        player = self.make_player(1, self.node)
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def teardown() -> None:
+            started.set()
+            await release.wait()
+
+        teardown_task = asyncio.create_task(teardown())
+        player._disconnect_task = teardown_task
+        removal = asyncio.create_task(
+            self.pool._disconnect_player(
+                cast("Node[Client]", self.node),
+                player,
+            )
+        )
+        await asyncio.wait_for(started.wait(), 2)
+        self.assertFalse(removal.done())
+
+        release.set()
+        await asyncio.wait_for(removal, 2)
+        self.assertTrue(teardown_task.done())
+        self.assertIsNone(self.node.get_player(1))
 
 
 class PlayerTeardownObservationTests(IsolatedAsyncioTestCase):

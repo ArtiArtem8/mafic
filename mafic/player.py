@@ -805,13 +805,27 @@ class Player(VoiceProtocol, Generic[ClientT]):
 
         return super().cleanup()
 
-    async def transfer_to(self, node: Node[ClientT]) -> None:
+    async def transfer_to(
+        self,
+        node: Node[ClientT],
+        *,
+        expected_source: Node[ClientT] | None = None,
+    ) -> bool:
         """Transfer the player to a new node.
 
         Parameters
         ----------
         node:
             The node to transfer to.
+        expected_source:
+            If provided, transfer only while this node still owns the player.
+            The check runs under the same lock that protects ownership changes.
+
+        Returns
+        -------
+        :class:`bool`
+            ``True`` when the transfer ran, ``False`` when ``expected_source``
+            no longer owned the player.
 
         Raises
         ------
@@ -834,7 +848,10 @@ class Player(VoiceProtocol, Generic[ClientT]):
         voice readiness: wait for :attr:`connected` on the assigned target.
         """
         async with self._voice_update_lock:
+            if expected_source is not None and self._node is not expected_source:
+                return False
             await self._transfer_to_unlocked(node)
+            return True
 
     async def _transfer_to_unlocked(self, node: Node[ClientT]) -> None:
         """Transfer ownership while holding `_voice_update_lock`."""

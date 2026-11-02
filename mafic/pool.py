@@ -74,7 +74,8 @@ class NodePool(Generic[ClientT]):
         default_strategies: StrategyList[ClientT] | None = None,
     ) -> None:
         NodePool._client = client
-        self._remove_tasks: dict[str, asyncio.Task[None]] = {}
+        # Identity, not label: a replacement with the same label is a new node.
+        self._remove_tasks: dict[Node[Any], asyncio.Task[None]] = {}
 
         NodePool._default_strategies = (
             [
@@ -237,9 +238,11 @@ class NodePool(Generic[ClientT]):
 
         The node leaves the pool before player teardown. Every player operation
         is attempted even when another player fails, and the node is always
-        closed afterwards. Concurrent calls for the same label share one owned
-        operation; a caller cancellation is propagated only after it settles.
-        The first caller's ``transfer_players`` value owns that operation.
+        closed afterwards. Concurrent calls for the same node instance share one
+        owned operation; a caller cancellation is propagated only after it
+        settles. The first caller's ``transfer_players`` value owns that
+        operation. A replacement node registered under the same label is a
+        different instance and gets its own removal.
 
         A successful transfer keeps the target player. A failed transfer tears
         down only the original player if it still belongs to the removed node.
@@ -254,27 +257,27 @@ class NodePool(Generic[ClientT]):
         transfer_players:
             Whether to transfer players to other nodes or disconnect them.
         """
-        label = node if isinstance(node, str) else node.label
-        task = self._remove_tasks.get(label)
+        resolved = self._nodes[node] if isinstance(node, str) else node
+        task = self._remove_tasks.get(resolved)
         if task is None:
-            resolved = self._nodes[node] if isinstance(node, str) else node
             task = asyncio.create_task(
                 self._remove_node(resolved, transfer_players=transfer_players)
             )
-            self._remove_tasks[label] = task
-            task.add_done_callback(partial(self._forget_removal, label))
+            self._remove_tasks[resolved] = task
+            task.add_done_callback(partial(self._forget_removal, resolved))
         await await_owned(task)
 
-    def _forget_removal(self, label: str, task: asyncio.Task[None]) -> None:
+    def _forget_removal(self, node: Node[Any], task: asyncio.Task[None]) -> None:
         """Forget a finished removal only when it is still the registered one."""
-        if self._remove_tasks.get(label) is task:
-            self._remove_tasks.pop(label, None)
+        if self._remove_tasks.get(node) is task:
+            self._remove_tasks.pop(node, None)
 
     async def _remove_node(
         self, node: Node[ClientT], *, transfer_players: bool
     ) -> None:
         """Own one removal from pool deletion through node close."""
-        self._nodes.pop(node.label, None)
+        if self._nodes.get(node.label) is node:
+            self._nodes.pop(node.label, None)
         players = tuple(node.players)
         try:
             if transfer_players:
@@ -290,12 +293,18 @@ class NodePool(Generic[ClientT]):
         """Attempt every transfer, cleaning up only players left on the node."""
 
         async def transfer(player: Player[ClientT]) -> None:
+            if player.assigned_node is not node:
+                await self._disconnect_player(node, player)
+                return
             try:
                 target = self.get_node(
                     guild_id=player.guild.id,
                     endpoint=player.endpoint,  # pyright: ignore[reportPrivateUsage]
                 )
-                await player.transfer_to(target)
+                transferred = await player.transfer_to(target, expected_source=node)
+                if not transferred:
+                    await self._disconnect_player(node, player)
+                    return
             except (RuntimeError, NoNodesAvailable, PlayerNotConnected):
                 _log.error(
                     "Failed to transfer player %d from removed node %s.",
@@ -331,17 +340,25 @@ class NodePool(Generic[ClientT]):
         self, node: Node[ClientT], player: Player[ClientT]
     ) -> None:
         """Tear down one player only while it still owns the removed node."""
+        owner = player.assigned_node
+        if owner is not node and owner is not None:
+            if node.get_player(player.guild.id) is player:
+                node.remove_player(player.guild.id)
+            return
         try:
             if player.disconnect_started:
                 await player.wait_for_disconnect()
                 return
-            if player.assigned_node is not node:
+            if owner is not node:
                 return
             if player.guild.voice_client is not player:
                 return
             await player.disconnect(force=True)
         finally:
-            if player.assigned_node is node:
+            if (
+                player.assigned_node is node
+                and node.get_player(player.guild.id) is player
+            ):
                 node.remove_player(player.guild.id)
 
     @staticmethod

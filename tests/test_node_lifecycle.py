@@ -37,6 +37,8 @@ class NodeLifecycleTests(IsolatedAsyncioTestCase):
         self.release_players = asyncio.Event()
         self.delete_started = asyncio.Event()
         self.release_delete = asyncio.Event()
+        self.hang_started = asyncio.Event()
+        self.release_hang = asyncio.Event()
         self.attempts: asyncio.Queue[None] = asyncio.Queue()
         self.events: asyncio.Queue[str] = asyncio.Queue()
         self.retries: asyncio.Queue[None] = asyncio.Queue()
@@ -51,6 +53,9 @@ class NodeLifecycleTests(IsolatedAsyncioTestCase):
         app.router.add_get("/v4/sessions/{session}/players", self.players)
         app.router.add_delete(
             "/v4/sessions/{session}/players/{guild_id}", self.delete_player
+        )
+        app.router.add_get(
+            "/v4/sessions/{session}/players/{guild_id}", self.hang_player
         )
         self.server = TestServer(app)
         await self.server.start_server()
@@ -79,6 +84,7 @@ class NodeLifecycleTests(IsolatedAsyncioTestCase):
         """Ensure a failed test cannot leave reconnect tasks or sockets running."""
         self.release_players.set()
         self.release_delete.set()
+        self.release_hang.set()
         await self.node.close()
         await self.server.close()
 
@@ -128,6 +134,12 @@ class NodeLifecycleTests(IsolatedAsyncioTestCase):
         if self.hold_delete:
             await self.release_delete.wait()
         return web.Response(status=204)
+
+    async def hang_player(self, _request: web.Request) -> web.Response:
+        """Accept one player read and never answer until the test releases it."""
+        self.hang_started.set()
+        await self.release_hang.wait()
+        return web.json_response({})
 
     def attach_player(self) -> Player[Client]:
         """Attach a real player so reconnects have something to clean up."""
@@ -575,6 +587,12 @@ class NodeLifecycleTests(IsolatedAsyncioTestCase):
         self.assertIsNone(node._ws)
         self.assertIsNone(getattr(node, "_close_task", None))
 
+    def assert_tasks_finished(self, *tasks: asyncio.Task[object] | None) -> None:
+        """Assert that the exact task objects captured before close settled."""
+        for task in tasks:
+            if task is not None:
+                self.assertTrue(task.done(), f"Lifecycle task still running: {task!r}")
+
     async def test_close_aborts_hung_player_delete(self) -> None:
         """Shutdown does not wait for a player DELETE on a dead node."""
         self.hold_delete = True
@@ -585,6 +603,8 @@ class NodeLifecycleTests(IsolatedAsyncioTestCase):
         await self.next_event("node_unavailable")
         await self.allow_retry()
         await asyncio.wait_for(self.delete_started.wait(), 2)
+        listener = self.node._ws_task
+        reconnect = self.node._connect_task
 
         close_task = asyncio.create_task(self.node.close())
         try:
@@ -595,6 +615,7 @@ class NodeLifecycleTests(IsolatedAsyncioTestCase):
 
         self.assertFalse(close_task.cancelled())
         self.assertFalse(self.node.available)
+        self.assert_tasks_finished(listener, reconnect)
         self.assert_no_lifecycle_tasks(self.node)
         self.assertEqual(len(self.sockets), 2)
 
@@ -602,6 +623,7 @@ class NodeLifecycleTests(IsolatedAsyncioTestCase):
         """Concurrent and cancelled close callers share one owned teardown."""
         await self.node.connect()
         await self.next_event("node_ready")
+        listener = self.node._ws_task
 
         original = cast(
             "Callable[[Node[Client]], Coroutine[Any, Any, None]]",
@@ -631,12 +653,14 @@ class NodeLifecycleTests(IsolatedAsyncioTestCase):
 
         self.assertEqual(calls, 1)
         self.assertFalse(self.node.available)
+        self.assert_tasks_finished(listener)
         self.assert_no_lifecycle_tasks(self.node)
 
     async def test_close_survives_repeated_cancellation(self) -> None:
         """A second caller cancellation cannot strand the owned close."""
         await self.node.connect()
         await self.next_event("node_ready")
+        listener = self.node._ws_task
 
         original = cast(
             "Callable[[Node[Client]], Coroutine[Any, Any, None]]",
@@ -661,6 +685,7 @@ class NodeLifecycleTests(IsolatedAsyncioTestCase):
                 await close_task
 
         self.assertFalse(self.node.available)
+        self.assert_tasks_finished(listener)
         self.assert_no_lifecycle_tasks(self.node)
 
     async def test_close_preserves_external_session(self) -> None:
@@ -679,25 +704,31 @@ class NodeLifecycleTests(IsolatedAsyncioTestCase):
         self.addAsyncCleanup(node.close)
 
         await node.connect()
+        first_listener = node._ws_task
         await node.close()
         self.assertFalse(external.closed)
         self.assertFalse(node.available)
+        self.assert_tasks_finished(first_listener)
 
         await node.connect()
+        second_listener = node._ws_task
         self.assertTrue(node.available)
         await node.close()
         self.assertFalse(external.closed)
+        self.assert_tasks_finished(second_listener)
         self.assert_no_lifecycle_tasks(node)
 
     async def test_planned_close_does_not_reconnect(self) -> None:
         """A planned close never starts another connection attempt."""
         await self.node.connect()
         await self.next_event("node_ready")
+        listener = self.node._ws_task
         await self.node.close()
         await asyncio.sleep(0.05)
 
         self.assertEqual(len(self.sockets), 1)
         self.assertTrue(self.events.empty())
+        self.assert_tasks_finished(listener)
         self.assert_no_lifecycle_tasks(self.node)
 
     async def test_close_after_listener_loss_joins_everything(self) -> None:
@@ -706,22 +737,52 @@ class NodeLifecycleTests(IsolatedAsyncioTestCase):
         await self.next_event("node_ready")
         await self.sockets[0].close()
         await self.next_event("node_unavailable")
+        listener = self.node._ws_task
         await self.node.close()
         await asyncio.sleep(0.05)
 
         self.assertEqual(len(self.sockets), 1)
         self.assertTrue(self.events.empty())
+        self.assert_tasks_finished(listener)
         self.assert_no_lifecycle_tasks(self.node)
 
     async def test_node_can_reconnect_after_close(self) -> None:
         """Closing one connection does not make the node object terminal."""
         await self.node.connect()
         await self.next_event("node_ready")
+        first_listener = self.node._ws_task
         await self.node.close()
+        self.assert_tasks_finished(first_listener)
         self.assert_no_lifecycle_tasks(self.node)
 
         await self.node.connect()
         await self.next_event("node_ready")
+        second_listener = self.node._ws_task
         self.assertTrue(self.node.available)
         await self.node.close()
+        self.assert_tasks_finished(second_listener)
         self.assert_no_lifecycle_tasks(self.node)
+
+    async def test_http_timeout_fires_against_silent_server(self) -> None:
+        """A real request times out when the local server accepts and hangs."""
+        node: Node[Client] = Node(
+            host=self.server.host,
+            port=cast("int", self.server.make_url("/").port),
+            label="timeout",
+            password="test-password",  # noqa: S106
+            client=cast("Client", self.client),
+            timeout=1,
+            http_timeout=aiohttp.ClientTimeout(total=0.2),
+        )
+        self.addAsyncCleanup(node.close)
+        await node.connect()
+
+        try:
+            with self.assertRaises(TimeoutError):
+                await asyncio.wait_for(node.fetch_player(1), 2)
+            self.assertTrue(self.hang_started.is_set())
+        finally:
+            self.release_hang.set()
+
+        await node.close()
+        self.assert_no_lifecycle_tasks(node)
