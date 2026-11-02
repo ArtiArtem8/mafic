@@ -12,6 +12,7 @@ from os import getenv
 from typing import Any, cast
 from unittest import IsolatedAsyncioTestCase, skipUnless
 
+from aiohttp import ClientTimeout
 from yarl import URL
 
 INTEGRATION_URL = getenv("LAVALINK_INTEGRATION_URL")
@@ -36,7 +37,7 @@ class MaficLavalinkIntegrationTests(IsolatedAsyncioTestCase):
         """Build a Node that talks to the real node without a Discord client."""
         # Mafic refuses to import when several Discord libraries are installed,
         # so `MAFIC_IGNORE_LIBRARY_CHECK=1` may be needed to collect this module.
-        from asyncio import Event
+        from asyncio import Event, Lock
 
         from mafic.node import Node
 
@@ -54,6 +55,11 @@ class MaficLavalinkIntegrationTests(IsolatedAsyncioTestCase):
         node._msg_tasks = set()
         node._ready = Event()
         node._event_queue = Event()
+        node._closing = False
+        node._close_task = None
+        node._transport_lock = Lock()
+        node._owns_session = True
+        node._http_timeout = ClientTimeout(total=300)
         object.__setattr__(node, "_Node__password", INTEGRATION_PASSWORD)
         object.__setattr__(node, "_Node__session", None)
         self.node = node
