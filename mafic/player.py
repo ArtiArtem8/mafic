@@ -31,6 +31,7 @@ from .search_type import SearchType
 from .track import Track
 from .type_variables import ClientT
 from .typings import TrackWithInfo
+from .utils.tasks import await_owned
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -749,7 +750,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
             self._connected = False
             task = self._disconnect_task = asyncio.create_task(self._disconnect_voice())
 
-        await self._await_voice_cleanup(task)
+        await await_owned(task, extra={"guild": self._guild_id})
 
     @property
     def disconnect_started(self) -> bool:
@@ -770,32 +771,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
         """
         task = self._disconnect_task
         if task is not None:
-            await self._await_voice_cleanup(task)
-
-    async def _await_voice_cleanup(self, task: asyncio.Task[None]) -> None:
-        """Wait for voice cleanup before propagating caller cancellation."""
-        # Caller cancellation must not cancel the shared teardown or other waiters.
-        cancelled: asyncio.CancelledError | None = None
-        while True:
-            try:
-                await asyncio.shield(task)
-            except asyncio.CancelledError as exc:
-                if task.cancelled():
-                    raise
-                cancelled = exc
-            except Exception:
-                if cancelled is None:
-                    raise
-                _log.exception(
-                    "Failed to finish voice cleanup after caller cancellation.",
-                    extra={"guild": self._guild_id},
-                )
-                break
-            else:
-                break
-
-        if cancelled is not None:
-            raise cancelled
+            await await_owned(task, extra={"guild": self._guild_id})
 
     async def _disconnect_voice(self) -> None:
         """Finish terminal voice teardown once for all disconnect callers."""
@@ -822,20 +798,21 @@ class Player(VoiceProtocol, Generic[ClientT]):
         )
         async with self._voice_update_lock:
             node = self._node
+            # Either registry may already belong to someone else: a foreign
+            # protocol can occupy the Discord slot, and a restore may have
+            # adopted this guild on the node. In both cases this generation
+            # has nothing left to mutate, and _detach_local retires it through
+            # the same identity-checked path used everywhere else.
             voice_client = self.guild.voice_client
             owns_voice = voice_client is self or voice_client is None
             remote_player = node.get_player(self.guild.id) if node is not None else None
             owns_remote = node is None or remote_player is self or remote_player is None
             if not (owns_voice and owns_remote):
-                if node is not None and node.get_player(self.guild.id) is self:
-                    node.remove_player(self.guild.id)
-                self._node = None
-                self._cleanup_local_state()
+                self._detach_local()
                 return
 
             if node is not None:
-                if node.get_player(self.guild.id) is self:
-                    node.remove_player(self.guild.id)
+                node.discard_player(self)
                 try:
                     await node.destroy(guild_id=self.guild.id)
                 except HTTPNotFound:
@@ -1056,8 +1033,9 @@ class Player(VoiceProtocol, Generic[ClientT]):
 
         # The migration is committed; old cleanup is best-effort.
         try:
-            await self._await_voice_cleanup(
-                asyncio.create_task(old_node.destroy(guild_id=self.guild.id))
+            await await_owned(
+                asyncio.create_task(old_node.destroy(guild_id=self.guild.id)),
+                extra={"guild": self.guild.id, "node": old_node.label},
             )
         except Exception:  # noqa: BLE001 - committed migration, cleanup only
             _log.exception(

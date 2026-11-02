@@ -87,6 +87,13 @@ class NodeTransferTests(IsolatedAsyncioTestCase):
         def remove_player(guild_id: int) -> None:
             players.pop(guild_id, None)
 
+        def discard_player(player: Player[Client]) -> bool:
+            """Mirror Node.discard_player: identity-checked removal."""
+            if players.get(player.guild.id) is not player:
+                return False
+            del players[player.guild.id]
+            return True
+
         def get_player(guild_id: int) -> Player[Client] | None:
             return players.get(guild_id)
 
@@ -96,6 +103,7 @@ class NodeTransferTests(IsolatedAsyncioTestCase):
             _players=players,
             add_player=Mock(side_effect=add_player),
             remove_player=Mock(side_effect=remove_player),
+            discard_player=Mock(side_effect=discard_player),
             get_player=get_player,
             voice_update=AsyncMock(),
             update=AsyncMock(return_value=state),
@@ -469,7 +477,8 @@ class NodeTransferTests(IsolatedAsyncioTestCase):
     async def test_disconnect_cancelled_during_discord_leave(self) -> None:
         """Cancellation during Discord leave propagates only after cleanup."""
         await self.assert_cancelled_disconnect_finishes("leave")
-        with self.assertLogs("mafic.player", level="ERROR") as logs:
+        # The shared owned-task helper owns this log line now.
+        with self.assertLogs("mafic.utils.tasks", level="ERROR") as logs:
             self.setUp()
             await self.assert_cancelled_disconnect_finishes("leave", leave_fails=True)
         self.assertIn("after caller cancellation", logs.output[0])
