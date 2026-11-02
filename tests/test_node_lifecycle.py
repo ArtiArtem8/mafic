@@ -712,3 +712,16 @@ class NodeLifecycleTests(IsolatedAsyncioTestCase):
         self.assertEqual(len(self.sockets), 1)
         self.assertTrue(self.events.empty())
         self.assert_no_lifecycle_tasks(self.node)
+
+    async def test_node_can_reconnect_after_close(self) -> None:
+        """Closing one connection does not make the node object terminal."""
+        await self.node.connect()
+        await self.next_event("node_ready")
+        await self.node.close()
+        self.assert_no_lifecycle_tasks(self.node)
+
+        await self.node.connect()
+        await self.next_event("node_ready")
+        self.assertTrue(self.node.available)
+        await self.node.close()
+        self.assert_no_lifecycle_tasks(self.node)

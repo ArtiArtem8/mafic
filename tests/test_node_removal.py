@@ -129,6 +129,8 @@ class NodeRemovalTests(IsolatedAsyncioTestCase):
         self.node.close.assert_not_awaited()
         removal.cancel()
         await asyncio.sleep(0)
+        removal.cancel()
+        await asyncio.sleep(0)
         self.assertFalse(removal.done())
 
         release.set()
