@@ -239,6 +239,7 @@ class NodePool(Generic[ClientT]):
         is attempted even when another player fails, and the node is always
         closed afterwards. Concurrent calls for the same label share one owned
         operation; a caller cancellation is propagated only after it settles.
+        The first caller's ``transfer_players`` value owns that operation.
 
         A successful transfer keeps the target player. A failed transfer tears
         down only the original player if it still belongs to the removed node.
