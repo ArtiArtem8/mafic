@@ -293,12 +293,15 @@ class Player(VoiceProtocol, Generic[ClientT]):
         """Dispatch a player update to the node."""
         # Ordered against every other generation of this guild, so a create
         # cannot overtake a predecessor's still-running destroy.
-        async with self._coordinator.lane(), self._voice_update_lock:
+        async with self._coordinator.hold(), self._voice_update_lock:
             await self._dispatch_player_update_unlocked()
 
     async def _dispatch_player_update_unlocked(self) -> None:
         """Dispatch using current state while holding `_voice_update_lock`."""
-        if self._disconnect_requested:
+        # The epoch check must precede the PATCH: a superseded generation that
+        # still holds a stale node pointer would otherwise recreate the player
+        # a newer generation just installed in the same session slot.
+        if self._disconnect_requested or self._superseded():
             return
 
         node = self._node
@@ -518,7 +521,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
         The guild lane orders this update against the remote effects of every
         other generation for the same guild.
         """
-        async with self._coordinator.lane():
+        async with self._coordinator.hold():
             if self._superseded():
                 return
             await self._apply_voice_server_update(data)
@@ -609,7 +612,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
         # longer act for this guild once the claim has happened.
         self._take_ownership()
         async with asyncio.timeout(timeout):
-            async with self._coordinator.lane():
+            async with self._coordinator.hold():
                 if not self._coordinator.is_current(self, self._ownership_epoch):
                     raise PlayerNotConnected
                 await self.channel.guild.change_voice_state(
@@ -786,7 +789,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
 
     async def _disconnect_voice(self) -> None:
         """Finish terminal voice teardown once for all disconnect callers."""
-        async with self._coordinator.lane():
+        async with self._coordinator.hold():
             if self._superseded():
                 # A newer generation owns this guild. Retire local state only;
                 # its registries and remote player are not ours to touch.
@@ -795,7 +798,11 @@ class Player(VoiceProtocol, Generic[ClientT]):
             await self._teardown_voice()
 
     async def _teardown_voice(self) -> None:
-        """Tear down the generation that still owns this guild."""
+        """Tear down the generation that still owns this guild.
+
+        Requires the guild lane; :meth:`_disconnect_voice` is the only caller.
+        """
+        self._coordinator.require_lane()
         if self._end_confirmation is not None:
             self._end_confirmation.cancel()
             await asyncio.gather(self._end_confirmation, return_exceptions=True)
@@ -940,7 +947,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
         Ownership transfer preserves v4 playback identity but does not promise
         voice readiness: wait for :attr:`connected` on the assigned target.
         """
-        async with self._coordinator.lane(), self._voice_update_lock:
+        async with self._coordinator.hold(), self._voice_update_lock:
             if expected_source is not None and self._node is not expected_source:
                 return False
             if self._superseded():
@@ -949,7 +956,12 @@ class Player(VoiceProtocol, Generic[ClientT]):
             return True
 
     async def _transfer_to_unlocked(self, node: Node[ClientT]) -> None:
-        """Transfer ownership while holding `_voice_update_lock`."""
+        """Transfer ownership while holding the guild lane and the voice lock.
+
+        Both callers already hold the lane, so this method must never acquire
+        it again: the lane is not reentrant.
+        """
+        self._coordinator.require_lane()
         old_node = self._node
         if self._disconnect_requested or old_node is None:
             raise PlayerNotConnected
@@ -1195,17 +1207,26 @@ class Player(VoiceProtocol, Generic[ClientT]):
         self._pending_updates += 1
         state_updates = self._state_updates
         try:
-            data = await node.update(
-                guild_id=self._guild_id,
-                track=track,
-                position=position,
-                end_time=end_time,
-                volume=volume,
-                pause=pause,
-                filter=filter,
-                no_replace=not replace,
-                user_data=user_data,
-            )
+            # The PATCH is a remote mutation of one (session, guild) slot, so
+            # it shares the guild lane with teardown and transfer. Without
+            # this, a play/pause/seek racing a disconnect could recreate the
+            # player the teardown had just deleted.
+            async with self._coordinator.hold():
+                # Teardown may have started while this call waited for the
+                # lane; a PATCH after that DELETE would resurrect the player.
+                if self._disconnect_requested or self._superseded():
+                    raise PlayerNotConnected
+                data = await node.update(
+                    guild_id=self._guild_id,
+                    track=track,
+                    position=position,
+                    end_time=end_time,
+                    volume=volume,
+                    pause=pause,
+                    filter=filter,
+                    no_replace=not replace,
+                    user_data=user_data,
+                )
             if (
                 self._node is not node
                 or self._disconnect_requested

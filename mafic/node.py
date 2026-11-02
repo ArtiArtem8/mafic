@@ -1093,6 +1093,13 @@ class Node(Generic[ClientT]):
     ) -> Coro[None]:
         """Send a voice update to the node.
 
+        .. note::
+
+            This is a raw Lavalink call and takes part in no coordination.
+            mafic holds the guild lane around every internal call; a direct
+            caller assumes that responsibility and must not interleave this
+            PATCH with another mutation of the same (sessionId, guildId).
+
         Parameters
         ----------
         guild_id:
@@ -1163,6 +1170,13 @@ class Node(Generic[ClientT]):
     def destroy(self, guild_id: int) -> Coro[None]:
         """Destroy a player.
 
+        .. note::
+
+            This is a raw Lavalink call and takes part in no coordination.
+            Use :meth:`Player.disconnect` for a coordinated teardown; a
+            direct caller owns the ordering against other effects on the
+            same (sessionId, guildId).
+
         Parameters
         ----------
         guild_id:
@@ -1188,6 +1202,13 @@ class Node(Generic[ClientT]):
         user_data: Mapping[str, JSONValue] = MISSING,
     ) -> Coro[PlayerPayload]:
         """Update a player.
+
+        .. note::
+
+            This is a raw Lavalink call and takes part in no coordination.
+            Use :meth:`Player.update` for the coordinated form; a direct
+            caller owns the ordering against other effects on the same
+            (sessionId, guildId).
 
         Parameters
         ----------

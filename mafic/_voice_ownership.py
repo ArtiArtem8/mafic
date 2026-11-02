@@ -5,11 +5,13 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
 from weakref import WeakKeyDictionary, ref
 
 if TYPE_CHECKING:
-    from asyncio import Lock
+    from asyncio import Lock, Task
+    from collections.abc import AsyncGenerator
 
 __all__ = ("GuildVoiceCoordinator", "coordinator_for")
 
@@ -45,10 +47,11 @@ class GuildVoiceCoordinator:
 
     # __weakref__ lets callers observe when a coordinator is released without
     # keeping it alive; the registry itself never depends on that hook.
-    __slots__ = ("__weakref__", "_epoch", "_lane", "_owner")
+    __slots__ = ("__weakref__", "_epoch", "_holder", "_lane", "_owner")
 
     def __init__(self) -> None:
         self._lane: Lock = asyncio.Lock()
+        self._holder: Task[object] | None = None
         self._owner: ref[object] | None = None
         self._epoch = 0
 
@@ -64,9 +67,40 @@ class GuildVoiceCoordinator:
         """The latest generation granted for this guild."""
         return self._epoch
 
-    def lane(self) -> Lock:
-        """Return the serialized lane for remote effects in this guild."""
-        return self._lane
+    @asynccontextmanager
+    async def hold(self) -> AsyncGenerator[None, None]:
+        """Serialize this guild's remote effects for the calling task.
+
+        The lane is deliberately not reentrant. A task that already holds it
+        would otherwise wait for itself, so re-entry fails loudly instead of
+        deadlocking the guild forever.
+        """
+        task = asyncio.current_task()
+        if self._holder is task:
+            msg = "The guild lane is not reentrant."
+            raise RuntimeError(msg)
+        async with self._lane:
+            self._holder = task
+            try:
+                yield
+            finally:
+                self._holder = None
+
+    def holds_lane(self) -> bool:
+        """Whether the calling task currently holds this guild's lane."""
+        return self._holder is not None and self._holder is asyncio.current_task()
+
+    def require_lane(self) -> None:
+        """Fail loudly when an internal remote mutation bypasses the lane.
+
+        This is the runtime half of the contract documented on Node.update,
+        Node.voice_update and Node.destroy: mafic's own mutation paths must be
+        inside the lane, and a future bypass trips here instead of silently
+        racing a teardown.
+        """
+        if not self.holds_lane():
+            msg = "This operation requires the guild lane."
+            raise RuntimeError(msg)
 
     def claim(self, player: object) -> int:
         """Grant ownership to a player and return its new epoch.

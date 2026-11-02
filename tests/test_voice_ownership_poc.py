@@ -19,6 +19,8 @@ from mafic.__libraries import Client, VoiceChannel, VoiceProtocol
 from mafic.player import Player
 from mafic.pool import NodePool
 
+from .test_player_update import player_payload
+
 if TYPE_CHECKING:
     from mafic.node import Node
 
@@ -93,6 +95,9 @@ class FakeNode:
         self.version = 4
         self._players: dict[int, Player[Client]] = {}
         self.destroy_calls = 0
+        self.update_calls = 0
+        self.voice_update_calls = 0
+        self.events: list[str] = []
         self.destroy_started = Event()
         self.release_destroy = Event()
         self.block_destroy = False
@@ -121,9 +126,21 @@ class FakeNode:
         del self._players[player.guild.id]
         return True
 
+    async def update(self, **_kwargs: object) -> object:
+        """Record a PATCH and answer with a well-formed player payload."""
+        self.update_calls += 1
+        self.events.append("patch")
+        return player_payload()
+
+    async def voice_update(self, **_kwargs: object) -> None:
+        """Record a voice PATCH without a transport."""
+        self.voice_update_calls += 1
+        self.events.append("voice_patch")
+
     async def destroy(self, **_kwargs: object) -> None:
         """Stand in for DELETE /sessions/{id}/players/{guild}, with a barrier."""
         self.destroy_calls += 1
+        self.events.append("delete")
         self.destroy_started.set()
         if self.block_destroy:
             await self.release_destroy.wait()
@@ -178,7 +195,7 @@ class VoiceOwnershipTests(IsolatedAsyncioTestCase):
         release = Event()
 
         async def holder() -> None:
-            async with player._coordinator.lane():
+            async with player._coordinator.hold():
                 held.set()
                 await release.wait()
 
