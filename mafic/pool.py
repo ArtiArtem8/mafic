@@ -342,8 +342,7 @@ class NodePool(Generic[ClientT]):
         """Tear down one player only while it still owns the removed node."""
         owner = player.assigned_node
         if owner is not node and owner is not None:
-            if node.get_player(player.guild.id) is player:
-                node.remove_player(player.guild.id)
+            node.discard_player(player)
             return
         try:
             if player.disconnect_started:
@@ -355,8 +354,7 @@ class NodePool(Generic[ClientT]):
                 return
             await player.disconnect(force=True)
         finally:
-            if node.get_player(player.guild.id) is player:
-                node.remove_player(player.guild.id)
+            node.discard_player(player)
 
     @staticmethod
     def _log_failed_teardowns(node: Node[ClientT], results: Sequence[object]) -> None:

@@ -44,6 +44,13 @@ class FakeNode:
         """Forget one player without touching Discord voice state."""
         self._players.pop(guild_id, None)
 
+    def discard_player(self, player: Player[Client]) -> bool:
+        """Mirror Node.discard_player: remove only the exact registered player."""
+        if self._players.get(player.guild.id) is not player:
+            return False
+        del self._players[player.guild.id]
+        return True
+
 
 class NodeRemovalTests(IsolatedAsyncioTestCase):
     """Exercise pool removal against real Player instances and fake nodes."""

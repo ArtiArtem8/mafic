@@ -22,6 +22,7 @@ from .__libraries import (
     VoiceChannel,
     VoiceProtocol,
 )
+from ._voice_ownership import coordinator_for
 from .errors import NoNodesAvailable, PlayerNotConnected
 from .events import *
 from .filter import Filter
@@ -107,6 +108,10 @@ class Player(VoiceProtocol, Generic[ClientT]):
         self._node = node
 
         self._guild_id: int = self.guild.id
+        # One guild has one authoritative voice owner per client. The
+        # coordinator mints the generation this instance is compared against.
+        self._coordinator = coordinator_for(client, self._guild_id)
+        self._ownership_epoch = 0
         self._session_id: str | None = None
         self._server_state: VoiceServerUpdatePayload | None = None
         self._connected: bool = False
@@ -286,7 +291,9 @@ class Player(VoiceProtocol, Generic[ClientT]):
 
     async def _dispatch_player_update(self) -> None:
         """Dispatch a player update to the node."""
-        async with self._voice_update_lock:
+        # Ordered against every other generation of this guild, so a create
+        # cannot overtake a predecessor's still-running destroy.
+        async with self._coordinator.lane(), self._voice_update_lock:
             await self._dispatch_player_update_unlocked()
 
     async def _dispatch_player_update_unlocked(self) -> None:
@@ -508,6 +515,18 @@ class Player(VoiceProtocol, Generic[ClientT]):
     async def on_voice_server_update(self, data: VoiceServerUpdatePayload) -> None:
         """Handle a voice server update.
 
+        The guild lane orders this update against the remote effects of every
+        other generation for the same guild.
+        """
+        async with self._coordinator.lane():
+            if self._superseded():
+                return
+            await self._apply_voice_server_update(data)
+        self._voice_server_update_event.set()
+
+    async def _apply_voice_server_update(self, data: VoiceServerUpdatePayload) -> None:
+        """Apply a voice server update while the caller holds the guild lane.
+
         This is called by the library and usually should not be called by the user.
 
         Parameters
@@ -550,8 +569,6 @@ class Player(VoiceProtocol, Generic[ClientT]):
                 selected_node.add_player(self._guild_id, self)
                 await self._dispatch_player_update_unlocked()
 
-        self._voice_server_update_event.set()
-
     async def connect(
         self,
         *,
@@ -587,9 +604,19 @@ class Player(VoiceProtocol, Generic[ClientT]):
 
         _log.debug("Connecting to voice channel %s", self.channel.id)
 
-        await self.channel.guild.change_voice_state(
-            channel=self.channel, self_mute=self_mute, self_deaf=self_deaf
-        )
+        # The claim is this connect's linearization point. It demotes any
+        # older generation immediately, so a teardown still in flight can no
+        # longer act for this guild once the claim has happened.
+        self._take_ownership()
+        async with asyncio.timeout(timeout):
+            async with self._coordinator.lane():
+                if not self._coordinator.is_current(self, self._ownership_epoch):
+                    raise PlayerNotConnected
+                await self.channel.guild.change_voice_state(
+                    channel=self.channel,
+                    self_mute=self_mute,
+                    self_deaf=self_deaf,
+                )
         futures = [
             self._voice_state_update_event.wait(),
             self._voice_server_update_event.wait(),
@@ -759,6 +786,16 @@ class Player(VoiceProtocol, Generic[ClientT]):
 
     async def _disconnect_voice(self) -> None:
         """Finish terminal voice teardown once for all disconnect callers."""
+        async with self._coordinator.lane():
+            if self._superseded():
+                # A newer generation owns this guild. Retire local state only;
+                # its registries and remote player are not ours to touch.
+                self._detach_local()
+                return
+            await self._teardown_voice()
+
+    async def _teardown_voice(self) -> None:
+        """Tear down the generation that still owns this guild."""
         if self._end_confirmation is not None:
             self._end_confirmation.cancel()
             await asyncio.gather(self._end_confirmation, return_exceptions=True)
@@ -797,6 +834,12 @@ class Player(VoiceProtocol, Generic[ClientT]):
                 self._cleanup_local_state()
                 return
 
+            # The destroy above had an await point; a newer generation may have
+            # claimed the guild while this teardown was in flight.
+            if self._superseded():
+                self._cleanup_local_state()
+                return
+
             try:
                 _log.debug(
                     "Disconnecting from voice channel.",
@@ -816,13 +859,44 @@ class Player(VoiceProtocol, Generic[ClientT]):
         self._ping = 0
         self._connected = False
 
+    def _take_ownership(self) -> None:
+        """Claim this guild's ownership lane for this instance."""
+        self._ownership_epoch = self._coordinator.claim(self)
+
+    def _superseded(self) -> bool:
+        """Whether a newer generation has taken this guild from this player.
+
+        A player that never claimed has no generation to defend, so it keeps
+        the pre-coordinator behaviour instead of silently losing its teardown.
+        """
+        return self._ownership_epoch != 0 and not self._coordinator.is_current(
+            self, self._ownership_epoch
+        )
+
+    def _detach_local(self) -> None:
+        """Retire this generation without touching a newer owner's state."""
+        node = self._node
+        if node is not None:
+            node.discard_player(self)
+        self._node = None
+        # A superseded player is normally no longer the cache occupant, but
+        # the gate makes the exception harmless instead of a leak.
+        self.cleanup()
+
     def cleanup(self) -> None:
         """Clean up the player.
 
         This shouldn't be called directly. Instead, use :meth:`disconnect`.
+
+        The Discord cache slot is removed only while this instance still holds
+        it. The check and the removal share one synchronous block, so no other
+        coroutine can install a replacement between them. Base
+        ``VoiceProtocol.cleanup`` removes by guild id unconditionally, which
+        would otherwise let a stale player evict the current owner.
         """
         self._cleanup_local_state()
-        return super().cleanup()
+        if self.guild.voice_client is self:
+            super().cleanup()
 
     async def transfer_to(
         self,
@@ -866,9 +940,11 @@ class Player(VoiceProtocol, Generic[ClientT]):
         Ownership transfer preserves v4 playback identity but does not promise
         voice readiness: wait for :attr:`connected` on the assigned target.
         """
-        async with self._voice_update_lock:
+        async with self._coordinator.lane(), self._voice_update_lock:
             if expected_source is not None and self._node is not expected_source:
                 return False
+            if self._superseded():
+                raise PlayerNotConnected
             await self._transfer_to_unlocked(node)
             return True
 

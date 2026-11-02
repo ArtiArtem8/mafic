@@ -1,0 +1,109 @@
+"""Ownership coordination for one guild voice session."""
+
+# SPDX-License-Identifier: MIT
+
+from __future__ import annotations
+
+import asyncio
+from typing import TYPE_CHECKING
+from weakref import WeakKeyDictionary
+
+if TYPE_CHECKING:
+    from asyncio import Lock
+
+__all__ = ("GuildVoiceCoordinator", "coordinator_for")
+
+
+class GuildVoiceCoordinator:
+    """Single writer for one guild voice session on one client.
+
+    Two kinds of mutation exist here, and they need different mechanisms.
+
+    Local registries are the Discord voice-client cache and Node._players. A
+    check and a write against them must happen in one synchronous block on the
+    event loop, because that is the only thing that makes the pair atomic. This
+    class does not wrap those writes; it supplies the epoch a caller compares
+    against, and the callers keep their check and write adjacent.
+
+    Remote effects are the Lavalink PATCH and DELETE that outlive the object
+    that issued them. These need a real ordered lane, because a replacement
+    generation is a different Player with a different lock, so no per-object
+    lock can order it against its predecessor.
+
+    The lane is not reentrant and must never be awaited while holding another
+    lock that a Discord callback needs to acquire. A teardown that waited on a
+    callback which itself needed the lane would deadlock. The lock order is
+    therefore always lane-before-Player-lock, never the reverse.
+    """
+
+    __slots__ = ("_epoch", "_lane", "_owner")
+
+    def __init__(self) -> None:
+        self._lane: Lock = asyncio.Lock()
+        self._owner: object | None = None
+        self._epoch = 0
+
+    @property
+    def owner(self) -> object | None:
+        """The player currently authorised to speak for this guild."""
+        return self._owner
+
+    @property
+    def epoch(self) -> int:
+        """The latest generation granted for this guild."""
+        return self._epoch
+
+    def lane(self) -> Lock:
+        """Return the serialized lane for remote effects in this guild."""
+        return self._lane
+
+    def claim(self, player: object) -> int:
+        """Grant ownership to a player and return its new epoch.
+
+        This is synchronous on purpose. It is the linearization point of a
+        connect, so it must not be separated from the caller decision that
+        follows by an await. A claim immediately demotes every older
+        generation, which is what makes a hung teardown safe rather than
+        merely slow.
+        """
+        self._epoch += 1
+        self._owner = player
+        return self._epoch
+
+    def release(self, player: object) -> None:
+        """Drop ownership only when the caller still holds it."""
+        if self._owner is player:
+            self._owner = None
+
+    def is_current(self, player: object, epoch: int | None = None) -> bool:
+        """Whether a player, optionally at a specific epoch, is authoritative.
+
+        The epoch argument distinguishes one owner from itself before and after
+        a re-claim, which identity alone cannot do.
+        """
+        if self._owner is not player:
+            return False
+        return epoch is None or self._epoch == epoch
+
+
+_coordinators: WeakKeyDictionary[object, dict[int, GuildVoiceCoordinator]] = (
+    WeakKeyDictionary()
+)
+
+
+def coordinator_for(client: object, guild_id: int) -> GuildVoiceCoordinator:
+    """Return the coordinator for one guild on one client.
+
+    The scope is the client, not the NodePool. Discord keys its voice-client
+    cache by guild id per connection, so two pools on one client already fight
+    over the same cache slot; separate clients do not. NodePool._nodes is a
+    class attribute, so it cannot provide this scoping.
+    """
+    per_guild = _coordinators.get(client)
+    if per_guild is None:
+        per_guild = {}
+        _coordinators[client] = per_guild
+    coordinator = per_guild.get(guild_id)
+    if coordinator is None:
+        coordinator = per_guild[guild_id] = GuildVoiceCoordinator()
+    return coordinator

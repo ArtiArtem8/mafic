@@ -627,7 +627,7 @@ class NodeLifecycleTests(IsolatedAsyncioTestCase):
 
         original = cast(
             "Callable[[Node[Client]], Coroutine[Any, Any, None]]",
-            Node._disconnect,
+            cast("type[Node[Client]]", Node)._disconnect,
         )
         calls = 0
         started = asyncio.Event()
@@ -664,7 +664,7 @@ class NodeLifecycleTests(IsolatedAsyncioTestCase):
 
         original = cast(
             "Callable[[Node[Client]], Coroutine[Any, Any, None]]",
-            Node._disconnect,
+            cast("type[Node[Client]]", Node)._disconnect,
         )
         started = asyncio.Event()
         release = asyncio.Event()

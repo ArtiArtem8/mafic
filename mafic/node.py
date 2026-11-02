@@ -507,6 +507,29 @@ class Node(Generic[ClientT]):
         """
         self._players.pop(guild_id, None)
 
+    def discard_player(self, player: Player[ClientT]) -> bool:
+        """Remove a player only while it is still this node's player.
+
+        :meth:`remove_player` keys by guild id alone, so a stale generation
+        could discard the replacement registered for the same guild. The
+        identity check and the removal share one synchronous block, which
+        makes them atomic on the event loop.
+
+        Parameters
+        ----------
+        player:
+            The player that believes it owns this guild.
+
+        Returns
+        -------
+        :class:`bool`
+            ``True`` when this call removed the player.
+        """
+        if self._players.get(player.guild.id) is not player:
+            return False
+        del self._players[player.guild.id]
+        return True
+
     async def _check_version(self) -> int:
         """:class:`int`: The major version of the node.
 
@@ -1557,6 +1580,9 @@ class Node(Generic[ClientT]):
 
         player.set_state(state)
         player._node = self  # pyright: ignore[reportPrivateUsage]
+        # The restored player becomes this guild's generation, so an older
+        # local instance can no longer speak for it.
+        player._take_ownership()  # pyright: ignore[reportPrivateUsage]
 
         self._players[player_id] = player
         (
@@ -1575,8 +1601,9 @@ class Node(Generic[ClientT]):
         player_id:
             The guild ID of the player.
         """
-        await self._players[player_id].disconnect(force=True)
-        self.remove_player(player_id)
+        player = self._players[player_id]
+        await player.disconnect(force=True)
+        self.discard_player(player)
 
     async def sync_players(
         self, player_cls: type[Player[ClientT]] | None = None
