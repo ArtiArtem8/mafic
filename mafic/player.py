@@ -711,6 +711,27 @@ class Player(VoiceProtocol, Generic[ClientT]):
 
         await self._await_voice_cleanup(task)
 
+    @property
+    def disconnect_started(self) -> bool:
+        """Whether terminal voice teardown has started.
+
+        This remains true after teardown finishes. It lets callers distinguish
+        "not started" from "already running or complete" without exposing the
+        private task.
+        """
+        return self._disconnect_task is not None
+
+    async def wait_for_disconnect(self) -> None:
+        """Wait for an already-started disconnect without starting another.
+
+        If no teardown has started this returns immediately. If one is running,
+        waits for it to settle and propagates its failure. A caller cancellation
+        is propagated only after the owned teardown completes.
+        """
+        task = self._disconnect_task
+        if task is not None:
+            await self._await_voice_cleanup(task)
+
     async def _await_voice_cleanup(self, task: asyncio.Task[None]) -> None:
         """Wait for voice cleanup before propagating caller cancellation."""
         # Caller cancellation must not cancel the shared teardown or other waiters.

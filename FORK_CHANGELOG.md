@@ -5,6 +5,26 @@ Changes in `maintained/lavalink-v4` since upstream
 Dates follow Git history. Related code, test and documentation commits are grouped
 into one entry, with links to the original changes.
 
+## November 3, 2026
+
+- Added configurable `http_timeout` for internally created node sessions
+  - `None` keeps aiohttp's 300 second total deadline
+  - `ClientTimeout(total=None)` explicitly disables it
+  - A caller-supplied session remains caller-owned and is not closed by the node
+- Made `Node.close()` a single owned operation
+  - Repeated and cancelled callers share one teardown
+  - An internally owned HTTP session is aborted before waiting for reconnect
+  - A planned close cannot publish another unavailable event or reconnect
+  - The node may be connected again after close completes
+- Made `NodePool.remove_node()` all-settled and cancellation-safe
+  - Concurrent removals of one label share one operation
+  - A successful transfer is preserved; a failed transfer cleans only its source
+  - A replaced Discord voice client is never disconnected
+  - Every started player teardown finishes before the node closes
+- Added `Player.disconnect_started` and `Player.wait_for_disconnect()`
+- Added regression tests for hung REST teardown, cancellation, concurrent removal,
+  external sessions and lifecycle task ownership
+
 ## November 1, 2026
 
 [Changes](https://github.com/ArtiArtem8/mafic/compare/23de661...818a0c8)

@@ -15,6 +15,7 @@ from .node import Node
 from .strategy import Strategy, StrategyCallable, call_strategy
 from .type_variables import ClientT
 from .utils import classproperty
+from .utils.tasks import await_owned
 
 if TYPE_CHECKING:
     from typing import ClassVar
@@ -60,7 +61,7 @@ class NodePool(Generic[ClientT]):
         [:attr:`Strategy.SHARD`, :attr:`Strategy.LOCATION`, :attr:`Strategy.USAGE`].
     """
 
-    __slots__ = ()
+    __slots__ = ("_remove_tasks",)
 
     # Generics as expected, do not work in class variables.
     # Don't fear, the public methods using this are typed well.
@@ -73,6 +74,7 @@ class NodePool(Generic[ClientT]):
         default_strategies: StrategyList[ClientT] | None = None,
     ) -> None:
         NodePool._client = client
+        self._remove_tasks: dict[str, asyncio.Task[None]] = {}
 
         NodePool._default_strategies = (
             [
@@ -104,6 +106,7 @@ class NodePool(Generic[ClientT]):
         secure: bool = False,
         heartbeat: int = 30,
         timeout: float = 10,
+        http_timeout: aiohttp.ClientTimeout | None = None,
         session: aiohttp.ClientSession | None = None,
         resume_key: str | None = None,
         regions: Sequence[Group | Region | VoiceRegion] | None = None,
@@ -131,8 +134,13 @@ class NodePool(Generic[ClientT]):
             The interval to send heartbeats to the node websocket connection.
         timeout:
             The timeout to use for the node websocket connection.
+        http_timeout: :data:`~typing.Optional`\[:class:`aiohttp.ClientTimeout`]
+            The timeout applied to internally created HTTP sessions. ``None``
+            uses aiohttp's default total timeout. Ignored when ``session`` is
+            supplied.
         session: :data:`~typing.Optional`\[:class:`aiohttp.ClientSession`]
             The session to use for the node websocket connection.
+            The caller retains ownership of a supplied session.
         resume_key:
             The key to use when resuming the node.
             If not provided, the key will be generated from the host, port and label.
@@ -184,6 +192,7 @@ class NodePool(Generic[ClientT]):
             secure=secure,
             heartbeat=heartbeat,
             timeout=timeout,
+            http_timeout=http_timeout,
             session=session,
             resume_key=resume_key,
             regions=regions,
@@ -226,6 +235,15 @@ class NodePool(Generic[ClientT]):
     ) -> None:
         """Remove a node from the pool.
 
+        The node leaves the pool before player teardown. Every player operation
+        is attempted even when another player fails, and the node is always
+        closed afterwards. Concurrent calls for the same label share one owned
+        operation; a caller cancellation is propagated only after it settles.
+
+        A successful transfer keeps the target player. A failed transfer tears
+        down only the original player if it still belongs to the removed node.
+        A replaced Discord voice client is never disconnected by this method.
+
         .. versionadded:: 2.6
 
         Parameters
@@ -233,48 +251,108 @@ class NodePool(Generic[ClientT]):
         node:
             The node to remove.
         transfer_players:
-            Whether to transfer players to other nodes or destroy them.
+            Whether to transfer players to other nodes or disconnect them.
         """
-        if isinstance(node, str):
-            node = self._nodes[node]
+        label = node if isinstance(node, str) else node.label
+        task = self._remove_tasks.get(label)
+        if task is None:
+            resolved = self._nodes[node] if isinstance(node, str) else node
+            task = asyncio.create_task(
+                self._remove_node(resolved, transfer_players=transfer_players)
+            )
+            self._remove_tasks[label] = task
+            task.add_done_callback(partial(self._forget_removal, label))
+        await await_owned(task)
 
-        # Remove prematurely so it is not chosen.
-        del self._nodes[node.label]
+    def _forget_removal(self, label: str, task: asyncio.Task[None]) -> None:
+        """Forget a finished removal only when it is still the registered one."""
+        if self._remove_tasks.get(label) is task:
+            self._remove_tasks.pop(label, None)
 
-        if transfer_players:
+    async def _remove_node(
+        self, node: Node[ClientT], *, transfer_players: bool
+    ) -> None:
+        """Own one removal from pool deletion through node close."""
+        self._nodes.pop(node.label, None)
+        players = tuple(node.players)
+        try:
+            if transfer_players:
+                await self._transfer_players(node, players)
+            else:
+                await self._disconnect_players(node, players)
+        finally:
+            await node.close()
 
-            async def transfer_player(player: Player[ClientT]) -> None:
-                try:
-                    target = self.get_node(
-                        guild_id=player.guild.id,
-                        endpoint=player.endpoint,  # pyright: ignore[reportPrivateUsage]
-                    )
-                    await player.transfer_to(target)
-                except (RuntimeError, NoNodesAvailable, PlayerNotConnected):
-                    _log.error(
-                        "Failed to transfer player %d, destroying it...",
-                        player.guild.id,
-                        exc_info=True,
-                        extra={"label": node.label},
-                    )
-                    await player.destroy()
+    async def _transfer_players(
+        self, node: Node[ClientT], players: Sequence[Player[ClientT]]
+    ) -> None:
+        """Attempt every transfer, cleaning up only players left on the node."""
 
-            tasks = [transfer_player(player) for player in node.players]
-            await asyncio.gather(*tasks)
-        else:
-
-            async def destroy_player(player: Player[ClientT]) -> None:
-                _log.debug(
-                    "Destroying player %d due to node removal...",
-                    player.guild.id,
-                    extra={"label": node.label},
+        async def transfer(player: Player[ClientT]) -> None:
+            try:
+                target = self.get_node(
+                    guild_id=player.guild.id,
+                    endpoint=player.endpoint,  # pyright: ignore[reportPrivateUsage]
                 )
-                await player.destroy()
+                await player.transfer_to(target)
+            except (RuntimeError, NoNodesAvailable, PlayerNotConnected):
+                _log.error(
+                    "Failed to transfer player %d from removed node %s.",
+                    player.guild.id,
+                    node.label,
+                    exc_info=True,
+                )
+                await self._disconnect_player(node, player)
+            except Exception:  # noqa: BLE001 - one player must not stop removal
+                _log.exception(
+                    "Unexpected player transfer failure from removed node %s.",
+                    node.label,
+                )
+                await self._disconnect_player(node, player)
 
-            tasks = [destroy_player(player) for player in node.players]
-            await asyncio.gather(*tasks)
+        results = await asyncio.gather(
+            *(transfer(player) for player in players),
+            return_exceptions=True,
+        )
+        self._log_failed_teardowns(node, results)
 
-        await node.close()
+    async def _disconnect_players(
+        self, node: Node[ClientT], players: Sequence[Player[ClientT]]
+    ) -> None:
+        """Attempt every disconnect without letting one failure stop others."""
+        results = await asyncio.gather(
+            *(self._disconnect_player(node, player) for player in players),
+            return_exceptions=True,
+        )
+        self._log_failed_teardowns(node, results)
+
+    async def _disconnect_player(
+        self, node: Node[ClientT], player: Player[ClientT]
+    ) -> None:
+        """Tear down one player only while it still owns the removed node."""
+        try:
+            if player.disconnect_started:
+                await player.wait_for_disconnect()
+                return
+            if player.assigned_node is not node:
+                return
+            if player.guild.voice_client is not player:
+                return
+            await player.disconnect(force=True)
+        finally:
+            if player.assigned_node is node:
+                node.remove_player(player.guild.id)
+
+    @staticmethod
+    def _log_failed_teardowns(node: Node[ClientT], results: Sequence[object]) -> None:
+        """Report failures that survived all-player teardown."""
+        for result in results:
+            if isinstance(result, BaseException):
+                _log.error(
+                    "Failed to tear down a player on removed node %s.",
+                    node.label,
+                    exc_info=(type(result), result, result.__traceback__),
+                )
 
     async def close(self) -> None:
         """Close all nodes in the pool.

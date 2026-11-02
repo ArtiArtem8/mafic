@@ -11,6 +11,7 @@ import warnings
 from asyncio import (
     FIRST_COMPLETED,
     Event,
+    Lock,
     create_task,
     current_task,
     gather,
@@ -45,6 +46,7 @@ from .typings import (
     RotatingNanoIPRouteDetails,
     TrackWithInfo,
 )
+from .utils.tasks import await_owned
 from .warnings import *
 
 if TYPE_CHECKING:
@@ -147,9 +149,15 @@ class Node(Generic[ClientT]):
     timeout:
         The amount of time the node will wait for a response before raising a timeout
         error.
+    http_timeout: :data:`~typing.Optional`\[:class:`aiohttp.ClientTimeout`]
+        The timeout applied to internally created HTTP sessions. ``None`` uses
+        aiohttp's default total timeout. Pass ``ClientTimeout(total=None)`` to
+        disable request timeouts explicitly. Ignored when ``session`` is supplied.
     session: :data:`~typing.Optional`\[:class:`aiohttp.ClientSession`]
         The session to use for the node.
         If not provided, a new session will be created.
+        The caller retains ownership of a supplied session; the node does not
+        close it.
     resume_key:
         The key to use when resuming the node.
         If not provided, the key will be generated from the host, port and label.
@@ -189,16 +197,21 @@ class Node(Generic[ClientT]):
         "_available",
         "_checked_version",
         "_client",
+        "_close_task",
+        "_closing",
         "_connect_task",
         "_heartbeat",
         "_host",
+        "_http_timeout",
         "_label",
         "_msg_tasks",
+        "_owns_session",
         "_players",
         "_port",
         "_resume_key",
         "_secure",
         "_timeout",
+        "_transport_lock",
         "_ready",
         "_rest_uri",
         "_resuming_session_id",
@@ -224,6 +237,7 @@ class Node(Generic[ClientT]):
         secure: bool = False,
         heartbeat: int = 30,
         timeout: float = 10,
+        http_timeout: aiohttp.ClientTimeout | None = None,
         session: aiohttp.ClientSession | None = None,
         resume_key: str | None = None,
         regions: Sequence[Group | Region | VoiceRegion] | None = None,
@@ -237,8 +251,15 @@ class Node(Generic[ClientT]):
         self._secure = secure
         self._heartbeat = heartbeat
         self._timeout = timeout
+        self._http_timeout = (
+            aiohttp.ClientTimeout(total=300) if http_timeout is None else http_timeout
+        )
         self._client = client
         self.__session = session
+        self._owns_session = session is None
+        self._closing = False
+        self._close_task: Task[None] | None = None
+        self._transport_lock = Lock()
         self.shard_ids: Sequence[int] | None = shard_ids
         self.regions: list[VoiceRegion] | None = _wrap_regions(regions)
 
@@ -621,7 +642,9 @@ class Node(Generic[ClientT]):
             You can change the timeout with the `timeout` parameter.
         """
         if (
-            self._ws is not None
+            self._closing
+            or (self._close_task is not None and not self._close_task.done())
+            or self._ws is not None
             or (self._connect_task is not None and not self._connect_task.done())
             or (self._ws_task is not None and not self._ws_task.done())
         ):
@@ -635,6 +658,8 @@ class Node(Generic[ClientT]):
         backoff: ExponentialBackoff[Literal[False]] | None,
         player_cls: type[Player[ClientT]] | None,
     ) -> Task[None]:
+        if self._closing:
+            raise NodeAlreadyConnected
         task = create_task(self._connect(backoff=backoff, player_cls=player_cls))
         self._connect_task = task
 
@@ -745,8 +770,9 @@ class Node(Generic[ClientT]):
                 self._client.dispatch("node_ready", self)
                 return
         except BaseException:
-            # Also clean up on caller cancellation or a ready/sync failure.
-            await self._disconnect()
+            # Terminal close owns transport teardown once it starts.
+            if not self._closing:
+                await self._disconnect()
             raise
 
     async def _wait_until_ready(
@@ -761,9 +787,13 @@ class Node(Generic[ClientT]):
         self._ready.clear()
         self._event_queue.clear()
 
-    async def _disconnect(self) -> None:
-        """Stop socket work before closing its transport."""
-        self._mark_unavailable()
+    def _cancel_transport_tasks(self) -> set[Task[None]]:
+        """Cancel current listener and message work without awaiting it.
+
+        This is also used by terminal close before waiting on another teardown
+        owner, so a cleanup coroutine that ignores cancellation cannot wedge the
+        final close. Cancellation is repeated deliberately.
+        """
         tasks = set(self._msg_tasks)
         if self._ws_task is not None:
             tasks.add(self._ws_task)
@@ -771,40 +801,104 @@ class Node(Generic[ClientT]):
             tasks.discard(current)
         for task in tasks:
             task.cancel()
-        # On external shutdown, join the listener even if it was already inside
-        # _disconnect. Its cleanup must stop before we take over socket closure.
-        await gather(*tasks, return_exceptions=True)
-        if self._ws is not None:
-            await self._ws.close()
-            self._ws = None
+        return tasks
+
+    async def _disconnect(self) -> None:
+        """Stop socket work before closing its transport."""
+        if self._closing and current_task() is not self._close_task:
+            return
+        async with self._transport_lock:
+            self._mark_unavailable()
+            tasks = self._cancel_transport_tasks()
+            # On external shutdown, join the listener even if it was already inside
+            # _disconnect. Its cleanup must stop before we take over socket closure.
+            await gather(*tasks, return_exceptions=True)
+            ws = self._ws
+            if ws is not None:
+                self._ws = None
+                try:
+                    await ws.close()
+                except Exception:  # noqa: BLE001 - transport is already stopping
+                    _log.debug(
+                        "Failed to close node websocket.",
+                        exc_info=True,
+                        extra={"label": self._label},
+                    )
+
+    async def _abort_http(self) -> None:
+        """Close an internally owned session so requests cannot hang shutdown."""
+        if not self._owns_session:
+            return
+        session = self.__session
+        if session is None:
+            return
+        self.__session = None
+        if session.closed:
+            return
+        try:
+            await session.close()
+        except Exception:  # noqa: BLE001 - shutdown must continue
+            _log.debug(
+                "Failed to close node HTTP session.",
+                exc_info=True,
+                extra={"label": self._label},
+            )
 
     async def close(self) -> None:
-        """Close the node.
+        """Close the node and finish its owned teardown.
 
-        This will disconnect the websocket and close the session.
+        Concurrent calls share one close operation. A caller's cancellation is
+        propagated only after that operation settles. An internally created
+        HTTP session is closed; a caller-supplied session is left open, so an
+        already-running request on that session may delay this call.
+        The node may be connected again with :meth:`connect` or
+        :meth:`NodePool.add_node` after this call completes.
 
         .. versionadded:: 2.6
         """
-        self._mark_unavailable()
-        if self._connect_task is not None:
-            self._connect_task.cancel()
-            await gather(self._connect_task, return_exceptions=True)
-        await self._disconnect()
+        task = self._close_task
+        if task is None:
+            self._closing = True
+            task = self._close_task = create_task(self._close())
+        if task is current_task():
+            return
+        await await_owned(task)
 
-        if self.__session is not None:
-            await self.__session.close()
-            self.__session = None
+    async def _close(self) -> None:
+        """Perform terminal teardown exactly once for current callers."""
+        try:
+            self._mark_unavailable()
 
-        _log.info("Node %s is now closed.", self._label, extra={"label": self._label})
-        self.cleanup()
+            reconnect = self._connect_task
+            if reconnect is not None:
+                reconnect.cancel()
+
+            # Abort REST before joining a reconnect that may be waiting on it.
+            await self._abort_http()
+            if reconnect is not None:
+                await gather(reconnect, return_exceptions=True)
+            # Break a listener teardown that may be waiting on a task which
+            # suppresses cancellation, then take over the final transport close.
+            self._cancel_transport_tasks()
+            await self._disconnect()
+        finally:
+            self.cleanup()
+            self._closing = False
+            self._close_task = None
+            _log.info(
+                "Node %s is now closed.",
+                self._label,
+                extra={"label": self._label},
+            )
 
     def cleanup(self) -> None:
-        """Cleanup the node, as if it was never connected."""
+        """Cleanup the node, as if it were never connected."""
         self._mark_unavailable()
         self._ws = None
         self._ws_task = None
         self._connect_task = None
-        self.__session = None
+        if self._owns_session:
+            self.__session = None
 
     async def _ws_listener(
         self, *, player_cls: type[Player[ClientT]] | None = None
@@ -835,8 +929,14 @@ class Node(Generic[ClientT]):
 
         # Cancellation deliberately bypasses recovery (Node.close owns shutdown).
         self._mark_unavailable()
+        if self._closing:
+            return
         self._client.dispatch("node_unavailable", self)
         await self._disconnect()
+
+        # A planned close must not publish another loss or start a reconnect.
+        if self._closing:
+            return
 
         # A pending connect already owns retries until ready + sync completes.
         if self._connect_task is not None and not self._connect_task.done():
@@ -1171,7 +1271,10 @@ class Node(Generic[ClientT]):
 
     async def _create_session(self) -> aiohttp.ClientSession:
         """Create a new session for the node."""
-        return aiohttp.ClientSession(json_serialize=dumps)
+        return aiohttp.ClientSession(
+            json_serialize=dumps,
+            timeout=self._http_timeout,
+        )
 
     async def __request(
         self,
@@ -1198,10 +1301,16 @@ class Node(Generic[ClientT]):
         :data:`~typing.Any`
             The JSON response from the node.
         """
+        if self._closing:
+            msg = "Node is closing."
+            raise RuntimeError(msg)
         if self.__session is None:
             self.__session = await self._create_session()
 
         session = self.__session
+        if session.closed:
+            msg = "Node HTTP session is closed."
+            raise RuntimeError(msg)
         uri = self._rest_uri / path
 
         _log.debug(

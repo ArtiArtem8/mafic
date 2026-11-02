@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import cast
+from typing import TYPE_CHECKING, cast
 from unittest import IsolatedAsyncioTestCase
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -13,11 +13,15 @@ import aiohttp
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 
-from mafic.__libraries import Client
+from mafic.__libraries import Client, Guild, VoiceChannel
 from mafic.errors import NodeAlreadyConnected
 from mafic.node import Node
 from mafic.player import Player
 from mafic.pool import NodePool
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Coroutine
+    from typing import Any
 
 
 class NodeLifecycleTests(IsolatedAsyncioTestCase):
@@ -28,8 +32,11 @@ class NodeLifecycleTests(IsolatedAsyncioTestCase):
         self.accept_connections = True
         self.send_ready = True
         self.hold_players = False
+        self.hold_delete = False
         self.players_requested = asyncio.Event()
         self.release_players = asyncio.Event()
+        self.delete_started = asyncio.Event()
+        self.release_delete = asyncio.Event()
         self.attempts: asyncio.Queue[None] = asyncio.Queue()
         self.events: asyncio.Queue[str] = asyncio.Queue()
         self.retries: asyncio.Queue[None] = asyncio.Queue()
@@ -42,10 +49,14 @@ class NodeLifecycleTests(IsolatedAsyncioTestCase):
         app.router.add_get("/v4/websocket", self.websocket)
         app.router.add_patch("/v4/sessions/{session}", self.configure)
         app.router.add_get("/v4/sessions/{session}/players", self.players)
+        app.router.add_delete(
+            "/v4/sessions/{session}/players/{guild_id}", self.delete_player
+        )
         self.server = TestServer(app)
         await self.server.start_server()
         self.client = Mock(spec=Client)
         self.client.user = Mock(id=123)
+        self.client.is_closed.return_value = False
         self.client.wait_until_ready = AsyncMock()
 
         def dispatch(event: str, _: Node[Client]) -> None:
@@ -67,6 +78,7 @@ class NodeLifecycleTests(IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         """Ensure a failed test cannot leave reconnect tasks or sockets running."""
         self.release_players.set()
+        self.release_delete.set()
         await self.node.close()
         await self.server.close()
 
@@ -109,6 +121,34 @@ class NodeLifecycleTests(IsolatedAsyncioTestCase):
         if session_id not in self.sessions:
             raise web.HTTPNotFound(text="Session not found")
         return web.json_response([])
+
+    async def delete_player(self, _request: web.Request) -> web.Response:
+        """Hold a player destruction request until the test releases it."""
+        self.delete_started.set()
+        if self.hold_delete:
+            await self.release_delete.wait()
+        return web.Response(status=204)
+
+    def attach_player(self) -> Player[Client]:
+        """Attach a real player so reconnects have something to clean up."""
+        guild = Mock(spec=Guild, id=1)
+        guild.change_voice_state = AsyncMock()
+        channel = Mock(spec=VoiceChannel, id=10, guild=guild)
+        player = Player(
+            cast("Client", self.client),
+            cast("VoiceChannel", channel),
+            node=self.node,
+        )
+        player._session_id = "discord-session"
+        player._server_state = {
+            "guild_id": 1,
+            "endpoint": "voice.example.com",
+            "token": "token",
+        }
+        player._connected = True
+        guild.voice_client = player
+        self.node.add_player(1, player)
+        return player
 
     async def pending_message(self) -> None:
         """Represent an old connection's message handler awaiting I/O."""
@@ -526,3 +566,149 @@ class NodeLifecycleTests(IsolatedAsyncioTestCase):
                 frame.json.assert_not_called()
                 await self.node.close()
                 self.assertTrue(listener.done())
+
+    def assert_no_lifecycle_tasks(self, node: Node[Client]) -> None:
+        """Assert that a closed node left no background lifecycle owner."""
+        self.assertIsNone(node._connect_task)
+        self.assertIsNone(node._ws_task)
+        self.assertFalse(node._msg_tasks)
+        self.assertIsNone(node._ws)
+        self.assertIsNone(getattr(node, "_close_task", None))
+
+    async def test_close_aborts_hung_player_delete(self) -> None:
+        """Shutdown does not wait for a player DELETE on a dead node."""
+        self.hold_delete = True
+        await self.node.connect()
+        await self.next_event("node_ready")
+        self.attach_player()
+        await self.sockets[0].close()
+        await self.next_event("node_unavailable")
+        await self.allow_retry()
+        await asyncio.wait_for(self.delete_started.wait(), 2)
+
+        close_task = asyncio.create_task(self.node.close())
+        try:
+            await asyncio.wait_for(close_task, 1)
+        finally:
+            self.release_delete.set()
+            await asyncio.gather(close_task, return_exceptions=True)
+
+        self.assertFalse(close_task.cancelled())
+        self.assertFalse(self.node.available)
+        self.assert_no_lifecycle_tasks(self.node)
+        self.assertEqual(len(self.sockets), 2)
+
+    async def test_close_is_shared_and_survives_repeated_cancellation(self) -> None:
+        """Concurrent and cancelled close callers share one owned teardown."""
+        await self.node.connect()
+        await self.next_event("node_ready")
+
+        original = cast(
+            "Callable[[Node[Client]], Coroutine[Any, Any, None]]",
+            Node._disconnect,
+        )
+        calls = 0
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocking_disconnect(node: Node[Client]) -> None:
+            nonlocal calls
+            calls += 1
+            started.set()
+            await release.wait()
+            await original(node)
+
+        with patch.object(Node, "_disconnect", new=blocking_disconnect):
+            first = asyncio.create_task(self.node.close())
+            await asyncio.wait_for(started.wait(), 2)
+            second = asyncio.create_task(self.node.close())
+            await asyncio.sleep(0)
+            first.cancel()
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await first
+            await asyncio.wait_for(second, 2)
+
+        self.assertEqual(calls, 1)
+        self.assertFalse(self.node.available)
+        self.assert_no_lifecycle_tasks(self.node)
+
+    async def test_close_survives_repeated_cancellation(self) -> None:
+        """A second caller cancellation cannot strand the owned close."""
+        await self.node.connect()
+        await self.next_event("node_ready")
+
+        original = cast(
+            "Callable[[Node[Client]], Coroutine[Any, Any, None]]",
+            Node._disconnect,
+        )
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocking_disconnect(node: Node[Client]) -> None:
+            started.set()
+            await release.wait()
+            await original(node)
+
+        with patch.object(Node, "_disconnect", new=blocking_disconnect):
+            close_task = asyncio.create_task(self.node.close())
+            await asyncio.wait_for(started.wait(), 2)
+            close_task.cancel()
+            await asyncio.sleep(0)
+            close_task.cancel()
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await close_task
+
+        self.assertFalse(self.node.available)
+        self.assert_no_lifecycle_tasks(self.node)
+
+    async def test_close_preserves_external_session(self) -> None:
+        """A caller-owned ClientSession is not closed by Node.close()."""
+        external = aiohttp.ClientSession()
+        self.addAsyncCleanup(external.close)
+        node: Node[Client] = Node(
+            host=self.server.host,
+            port=cast("int", self.server.make_url("/").port),
+            label="external",
+            password="test-password",  # noqa: S106
+            client=cast("Client", self.client),
+            timeout=1,
+            session=external,
+        )
+        self.addAsyncCleanup(node.close)
+
+        await node.connect()
+        await node.close()
+        self.assertFalse(external.closed)
+        self.assertFalse(node.available)
+
+        await node.connect()
+        self.assertTrue(node.available)
+        await node.close()
+        self.assertFalse(external.closed)
+        self.assert_no_lifecycle_tasks(node)
+
+    async def test_planned_close_does_not_reconnect(self) -> None:
+        """A planned close never starts another connection attempt."""
+        await self.node.connect()
+        await self.next_event("node_ready")
+        await self.node.close()
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(len(self.sockets), 1)
+        self.assertTrue(self.events.empty())
+        self.assert_no_lifecycle_tasks(self.node)
+
+    async def test_close_after_listener_loss_joins_everything(self) -> None:
+        """Closing during transport loss leaves no listener or reconnect task."""
+        await self.node.connect()
+        await self.next_event("node_ready")
+        await self.sockets[0].close()
+        await self.next_event("node_unavailable")
+        await self.node.close()
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(len(self.sockets), 1)
+        self.assertTrue(self.events.empty())
+        self.assert_no_lifecycle_tasks(self.node)
