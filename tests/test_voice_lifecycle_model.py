@@ -15,8 +15,8 @@ def rules(registry: GuildRegistry) -> list[str]:
     return [violation.rule for violation in registry.consistent()]
 
 
-class ModelRuleTests(TestCase):
-    """Negative controls: each rule must fire on the trace it describes."""
+class DetectorTests(TestCase):
+    """Detector correctness: each rule fires exactly on the trace it names."""
 
     def test_fixed_protocol_lifecycle_is_clean(self) -> None:
         """One generation registers, claims, patches, deletes and leaves."""
@@ -89,6 +89,47 @@ class ModelRuleTests(TestCase):
         registry.apply("register", "g1")
 
         self.assertIn("R-UNCLAIMED", rules(registry))
+
+
+class TransitionTests(TestCase):
+    """Allowed transitions stay clean, so the checker is not alarm-happy."""
+
+    def test_two_serial_generations_leave_the_slot_free(self) -> None:
+        """A full connect/disconnect cycle repeated for two generations."""
+        registry = GuildRegistry()
+        for token in ("g1", "g2"):
+            registry.apply("register", token)
+            registry.apply("claim", token)
+            registry.apply("patch", token, session="s1")
+            registry.apply("delete", token, session="s1")
+            registry.apply("unregister", token)
+
+        self.assertEqual(rules(registry), [])
+        self.assertIsNone(registry.registry)
+        self.assertEqual(registry.remote, {})
+
+    def test_transfer_between_sessions_is_clean(self) -> None:
+        """Two sessions belong to different slots, so both may exist at once."""
+        registry = GuildRegistry()
+        registry.apply("claim", "g1")
+        registry.apply("patch", "g1", session="s1")
+        registry.apply("patch", "g1", session="s2")
+        registry.apply("delete", "g1", session="s1")
+
+        self.assertEqual(rules(registry), [])
+        self.assertEqual(registry.remote, {"s2": "g1"})
+
+    def test_release_then_reclaim_is_clean(self) -> None:
+        """A finished teardown frees the guild for the next generation."""
+        registry = GuildRegistry()
+        registry.apply("register", "g1")
+        registry.apply("claim", "g1")
+        registry.apply("release", "g1")
+        registry.apply("register", "g2")
+        registry.apply("claim", "g2")
+
+        self.assertEqual(rules(registry), [])
+        self.assertEqual(registry.registry, "g2")
 
 
 class InterleavingTests(TestCase):

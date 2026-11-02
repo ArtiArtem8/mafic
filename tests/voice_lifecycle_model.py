@@ -98,7 +98,7 @@ class GuildRegistry:
             return
 
         if op == "unregister":
-            if self.registry is not token:
+            if self.registry != token:
                 # The unconditional pop in VoiceProtocol.cleanup: a stale
                 # Player removes the current owner from the Discord cache.
                 self._fail(
@@ -112,7 +112,7 @@ class GuildRegistry:
         if op == "release":
             if self.epoch_of.get(token) == self.epoch:
                 self.epoch_of.pop(token, None)
-                if self.registry is token:
+                if self.registry == token:
                     self.registry = None
             return
 
