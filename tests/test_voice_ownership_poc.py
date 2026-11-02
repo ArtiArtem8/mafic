@@ -98,6 +98,7 @@ class FakeNode:
         self.update_calls = 0
         self.voice_update_calls = 0
         self.events: list[str] = []
+        self.destroy_error: BaseException | None = None
         self.destroy_started = Event()
         self.release_destroy = Event()
         self.block_destroy = False
@@ -142,6 +143,8 @@ class FakeNode:
         self.destroy_calls += 1
         self.events.append("delete")
         self.destroy_started.set()
+        if self.destroy_error is not None:
+            raise self.destroy_error
         if self.block_destroy:
             await self.release_destroy.wait()
 

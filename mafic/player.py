@@ -23,7 +23,7 @@ from .__libraries import (
     VoiceProtocol,
 )
 from ._voice_ownership import coordinator_for
-from .errors import NoNodesAvailable, PlayerNotConnected
+from .errors import HTTPNotFound, NoNodesAvailable, PlayerNotConnected
 from .events import *
 from .filter import Filter
 from .pool import NodePool
@@ -611,6 +611,16 @@ class Player(VoiceProtocol, Generic[ClientT]):
         # older generation immediately, so a teardown still in flight can no
         # longer act for this guild once the claim has happened.
         self._take_ownership()
+        if self._coordinator.remote_unknown:
+            # Lavalink offers no conditional write, so an earlier DELETE that
+            # timed out may still be applied after this join and remove the
+            # player we are about to create. Only a different session fences
+            # that; record the risk rather than hiding it.
+            _log.warning(
+                "Connecting over an unresolved remote state; a late DELETE "
+                "from a previous generation may remove this player.",
+                extra={"guild": self._guild_id},
+            )
         async with asyncio.timeout(timeout):
             async with self._coordinator.hold():
                 if not self._coordinator.is_current(self, self._ownership_epoch):
@@ -828,11 +838,23 @@ class Player(VoiceProtocol, Generic[ClientT]):
                     node.remove_player(self.guild.id)
                 try:
                     await node.destroy(guild_id=self.guild.id)
-                except Exception:  # noqa: BLE001 - leave/cleanup must continue
-                    _log.exception(
-                        "Failed to destroy player during disconnect.",
+                except HTTPNotFound:
+                    # Confirmed absent: the exact DELETE outcome is known.
+                    _log.debug(
+                        "Player was already destroyed on the node.",
                         extra={"guild": self.guild.id, "node": node.label},
                     )
+                except Exception:  # noqa: BLE001 - leave/cleanup must continue
+                    # A timeout or lost connection leaves the server state
+                    # unknown: the DELETE may still be applied later. Record
+                    # it instead of pretending the player is gone.
+                    self._coordinator.mark_remote_unknown()
+                    _log.warning(
+                        "Player destroy outcome is unknown; the remote player "
+                        "may reappear and a late DELETE can still apply.",
+                        extra={"guild": self.guild.id, "node": node.label},
+                    )
+                    _log.debug("Player destroy failure traceback", exc_info=True)
                 finally:
                     self._node = None
 

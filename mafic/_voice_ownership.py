@@ -47,13 +47,21 @@ class GuildVoiceCoordinator:
 
     # __weakref__ lets callers observe when a coordinator is released without
     # keeping it alive; the registry itself never depends on that hook.
-    __slots__ = ("__weakref__", "_epoch", "_holder", "_lane", "_owner")
+    __slots__ = (
+        "__weakref__",
+        "_epoch",
+        "_holder",
+        "_lane",
+        "_owner",
+        "_remote_unknown",
+    )
 
     def __init__(self) -> None:
         self._lane: Lock = asyncio.Lock()
         self._holder: Task[object] | None = None
         self._owner: ref[object] | None = None
         self._epoch = 0
+        self._remote_unknown = 0
 
     @property
     def owner(self) -> object | None:
@@ -89,6 +97,21 @@ class GuildVoiceCoordinator:
     def holds_lane(self) -> bool:
         """Whether the calling task currently holds this guild's lane."""
         return self._holder is not None and self._holder is asyncio.current_task()
+
+    @property
+    def remote_unknown(self) -> int:
+        """How many remote effects of this guild ended with an unknown result.
+
+        Lavalink has no conditional write, so a lost DELETE response cannot be
+        fenced: the server may still apply it after this counter moves. The
+        value is a diagnostic and a reason to prefer another session, never
+        proof that a slot is empty.
+        """
+        return self._remote_unknown
+
+    def mark_remote_unknown(self) -> None:
+        """Record that a remote effect may or may not have been applied."""
+        self._remote_unknown += 1
 
     def require_lane(self) -> None:
         """Fail loudly when an internal remote mutation bypasses the lane.
