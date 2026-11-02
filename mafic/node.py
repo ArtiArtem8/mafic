@@ -26,6 +26,7 @@ import aiohttp
 import yarl
 
 from .__libraries import MISSING, ExponentialBackoff, dumps, loads
+from ._voice_ownership import coordinator_for
 from .errors import *
 from .ip import (
     BalancingIPRoutePlannerStatus,
@@ -1580,6 +1581,18 @@ class Node(Generic[ClientT]):
         cls:
             The class of the player to use.
         """
+        # A live generation already speaks for this guild. Restoring a second
+        # one would displace a connect that is still running through Discord,
+        # because the local player is only registered after its voice server
+        # update. Local absence is therefore not proof of remote ownership.
+        if coordinator_for(self.client, player_id).owner is not None:
+            _log.debug(
+                "Skipping restored player for guild %d: a live owner exists.",
+                player_id,
+                extra={"label": self._label},
+            )
+            return
+
         guild = self.client.get_guild(player_id)
         if guild is None:
             guild = await self.client.fetch_guild(player_id)
@@ -1599,13 +1612,25 @@ class Node(Generic[ClientT]):
 
         player = (cls or Player)(self.client, channel)
 
+        # Never write the Discord cache slot unconditionally. An occupant here
+        # is a protocol mafic did not create, and evicting it would strand a
+        # live voice session. Guild.voice_client is the public view of exactly
+        # the slot that _add_voice_client would overwrite.
+        if guild.voice_client is not None:
+            _log.debug(
+                "Skipping restored player for guild %d: the voice slot is in use.",
+                player_id,
+                extra={"label": self._label},
+            )
+            return
+
         player.set_state(state)
         player._node = self  # pyright: ignore[reportPrivateUsage]
         # The restored player becomes this guild's generation, so an older
         # local instance can no longer speak for it.
         player._take_ownership()  # pyright: ignore[reportPrivateUsage]
 
-        self._players[player_id] = player
+        self.add_player(player_id, player)
         (
             key,
             _,

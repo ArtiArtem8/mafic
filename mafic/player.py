@@ -902,6 +902,9 @@ class Player(VoiceProtocol, Generic[ClientT]):
         would otherwise let a stale player evict the current owner.
         """
         self._cleanup_local_state()
+        # Releasing is identity-gated, so a superseded player cannot free the
+        # guild for adoption on behalf of the generation that replaced it.
+        self._coordinator.release(self)
         if self.guild.voice_client is self:
             super().cleanup()
 
