@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 from unittest import IsolatedAsyncioTestCase
@@ -105,6 +106,33 @@ class RestorationTests(IsolatedAsyncioTestCase):
         self.assertEqual(self.node.players, [])
         self.assertIsNone(self.guild.voice_client)
         self.assertIs(live._coordinator.owner, live)
+
+    async def test_restore_does_not_displace_owner_claimed_during_guild_fetch(
+        self,
+    ) -> None:
+        """A claim during guild lookup still prevents restoration."""
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def fetch_guild(_guild_id: int) -> RestoreGuild:
+            started.set()
+            await release.wait()
+            return self.guild
+
+        with (
+            patch.object(self.client, "get_guild", return_value=None),
+            patch.object(self.client, "fetch_guild", new=fetch_guild, create=True),
+        ):
+            restore = asyncio.create_task(self.node.sync_players())
+            await asyncio.wait_for(started.wait(), 2)
+
+            live = self.make_player()
+            live._take_ownership()
+            release.set()
+            await asyncio.wait_for(restore, 2)
+
+        self.assertIs(live._coordinator.owner, live)
+        self.assertIsNone(self.guild.voice_client)
+        self.assertIsNone(self.node.get_player(GUILD_ID))
 
     async def test_restore_adopts_when_no_local_owner_exists(self) -> None:
         """An unowned remote player is adopted and claimed."""

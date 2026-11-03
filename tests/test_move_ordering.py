@@ -6,45 +6,23 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, cast
-from unittest import IsolatedAsyncioTestCase
+from typing import TYPE_CHECKING
 from unittest.mock import Mock, patch
 
-from mafic.__libraries import Client, VoiceChannel
+from mafic.__libraries import VoiceChannel
 from mafic.errors import PlayerNotConnected
-from mafic.player import Player
-from mafic.pool import NodePool
 
-from .test_voice_ownership_poc import (
-    CHANNEL_ID,
-    GUILD_ID,
-    MOVE_CHANNEL_ID,
-    FakeClient,
-    FakeGuild,
-    FakeNode,
-)
+from .test_voice_ownership_poc import MOVE_CHANNEL_ID, VoiceTestCase
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
-    from mafic.node import Node
+    from mafic.__libraries import Client
+    from mafic.player import Player
 
 
-class MoveOrderingTests(IsolatedAsyncioTestCase):
+class MoveOrderingTests(VoiceTestCase):
     """JOIN, MOVE and LEAVE share one gateway opcode and one lane."""
-
-    def setUp(self) -> None:
-        """Install private fakes so tests never share class state."""
-        self.client = FakeClient()
-        self.guild = FakeGuild(self.client)
-        self.node = FakeNode()
-        self.enterContext(patch.object(NodePool, "nodes", [self.node]))
-
-    def make_player(self) -> Player[Client]:
-        """Build a real Player bound to the fake guild and client."""
-        channel = Mock(spec=VoiceChannel, id=CHANNEL_ID, guild=self.guild)
-        channel._get_voice_client_key.return_value = (GUILD_ID, None)
-        return Player(cast("Client", self.client), channel)
 
     def target(self) -> Mock:
         """Build the voice channel a move is sent to."""
@@ -52,15 +30,8 @@ class MoveOrderingTests(IsolatedAsyncioTestCase):
 
     async def connected(self) -> Player[Client]:
         """Return a registered, claimed and node-bound owner."""
-        player = self.make_player()
-        self.client._connection._add_voice_client(GUILD_ID, player)
-        player._voice_state_update_event.set()
-        player._voice_server_update_event.set()
-        player._node_player_ready_event.set()
-        await player.connect(timeout=2, reconnect=True)
+        player = await self.bound_player()
         player._connected = True
-        self.node.add_player(GUILD_ID, player)
-        player._node = cast("Node[Client]", self.node)
         return player
 
     async def test_leave_and_delete_wait_for_an_in_flight_move(self) -> None:

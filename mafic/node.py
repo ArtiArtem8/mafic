@@ -85,6 +85,18 @@ URL_REGEX = re.compile(r"https?://")
 __all__ = ("Node",)
 
 
+def _is_retryable_websocket_error(error: Exception) -> bool:
+    """Classify a failed websocket handshake without retrying permanent errors."""
+    if isinstance(error, aiohttp.ClientResponseError):
+        return error.status == 429 or 500 <= error.status < 600
+    if isinstance(error, (aiohttp.ClientSSLError, aiohttp.ServerFingerprintMismatch)):
+        return False
+    return isinstance(
+        error,
+        (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError, TimeoutError),
+    )
+
+
 def _wrap_regions(
     regions: Sequence[Group | Region | VoiceRegion] | None,
 ) -> list[VoiceRegion] | None:
@@ -737,20 +749,7 @@ class Node(Generic[ClientT]):
                 try:
                     await self._connect_to_websocket(headers=headers, session=session)
                 except Exception as error:
-                    if isinstance(error, aiohttp.ClientResponseError):
-                        if error.status != 429 and not 500 <= error.status < 600:
-                            raise
-                    elif isinstance(
-                        error,
-                        (aiohttp.ClientSSLError, aiohttp.ServerFingerprintMismatch),
-                    ) or not isinstance(
-                        error,
-                        (
-                            aiohttp.ClientConnectionError,
-                            aiohttp.ClientPayloadError,
-                            TimeoutError,
-                        ),
-                    ):
+                    if not _is_retryable_websocket_error(error):
                         raise
                     delay = backoff.delay()
                     _log.exception(
@@ -1269,12 +1268,11 @@ class Node(Generic[ClientT]):
                     track.user_data if user_data is MISSING else user_data
                 )
                 track_data["userData"] = dict(resolved_user_data)
-            elif track is None:
-                track_data["encoded"] = None
-                if user_data is not MISSING:
-                    track_data["userData"] = dict(user_data)
             else:
-                track_data["identifier"] = track
+                if track is None:
+                    track_data["encoded"] = None
+                else:
+                    track_data["identifier"] = track
                 if user_data is not MISSING:
                     track_data["userData"] = dict(user_data)
 
@@ -1585,7 +1583,8 @@ class Node(Generic[ClientT]):
         # one would displace a connect that is still running through Discord,
         # because the local player is only registered after its voice server
         # update. Local absence is therefore not proof of remote ownership.
-        if coordinator_for(self.client, player_id).owner is not None:
+        coordinator = coordinator_for(self.client, player_id)
+        if coordinator.owner is not None:
             _log.debug(
                 "Skipping restored player for guild %d: a live owner exists.",
                 player_id,
@@ -1596,6 +1595,14 @@ class Node(Generic[ClientT]):
         guild = self.client.get_guild(player_id)
         if guild is None:
             guild = await self.client.fetch_guild(player_id)
+            # Guild lookup may have yielded while a new player claimed ownership.
+            if coordinator.owner is not None:
+                _log.debug(
+                    "Skipping restored player for guild %d: a live owner exists.",
+                    player_id,
+                    extra={"label": self._label},
+                )
+                return
 
         voice_state = guild.me.voice
 

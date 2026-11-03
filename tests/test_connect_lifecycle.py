@@ -5,43 +5,14 @@
 from __future__ import annotations
 
 import asyncio
-from typing import cast
-from unittest import IsolatedAsyncioTestCase
-from unittest.mock import Mock, patch
 
-from mafic.__libraries import Client, VoiceChannel
 from mafic.errors import PlayerNotConnected
-from mafic.player import Player
-from mafic.pool import NodePool
 
-from .test_voice_ownership_poc import (
-    CHANNEL_ID,
-    GUILD_ID,
-    FakeClient,
-    FakeGuild,
-    FakeNode,
-)
+from .test_voice_ownership_poc import VoiceTestCase
 
 
-class ConnectLifecycleTests(IsolatedAsyncioTestCase):
+class ConnectLifecycleTests(VoiceTestCase):
     """Every failure after the claim must release the guild and its tasks."""
-
-    def setUp(self) -> None:
-        """Install private fakes so tests never share class state."""
-        self.client = FakeClient()
-        self.guild = FakeGuild(self.client)
-        self.node = FakeNode()
-        self.enterContext(patch.object(NodePool, "nodes", [self.node]))
-
-    def make_player(self) -> Player[Client]:
-        """Build a real Player bound to the fake guild and client."""
-        channel = Mock(spec=VoiceChannel, id=CHANNEL_ID, guild=self.guild)
-        channel._get_voice_client_key.return_value = (GUILD_ID, None)
-        return Player(cast("Client", self.client), channel)
-
-    def register(self, player: Player[Client]) -> None:
-        """Occupy the Discord cache slot as Connectable.connect would."""
-        self.client._connection._add_voice_client(GUILD_ID, player)
 
     def assert_no_pending_tasks(self) -> None:
         """Fail if a connect left waiter or teardown tasks behind."""
@@ -160,6 +131,29 @@ class ConnectLifecycleTests(IsolatedAsyncioTestCase):
         self.assertNotIn("leave", self.guild.gateway)
         self.assert_no_pending_tasks()
 
+    async def test_superseded_before_join_does_not_send_gateway_request(self) -> None:
+        """A newer claim while the join waits on the lane cancels the old join."""
+        player = self.make_player()
+        self.register(player)
+        release = await self.hold_lane(player)
+        connect = asyncio.create_task(player.connect(timeout=5, reconnect=True))
+
+        async def wait_for_claim() -> None:
+            while player._coordinator.owner is not player:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(wait_for_claim(), 2)
+        replacement = self.make_player()
+        replacement._take_ownership()
+        release.set()
+
+        with self.assertRaises(PlayerNotConnected):
+            await asyncio.wait_for(connect, 2)
+
+        self.assertNotIn("join", self.guild.gateway)
+        self.assertNotIn("leave", self.guild.gateway)
+        self.assertIs(replacement._coordinator.owner, replacement)
+
     async def test_cancellation_before_the_join_starts_no_teardown(self) -> None:
         """Nothing remote happened, so cleanup must not queue on the lane."""
         player = self.make_player()
@@ -221,17 +215,3 @@ class ConnectLifecycleTests(IsolatedAsyncioTestCase):
         self.assertFalse(player.disconnect_started)
         self.assertNotIn("leave", self.guild.gateway)
         self.assertIs(self.guild.voice_client, replacement)
-
-    async def hold_lane(self, player: Player[Client]) -> asyncio.Event:
-        """Occupy the guild lane and return the event that releases it."""
-        held, release = asyncio.Event(), asyncio.Event()
-
-        async def holder() -> None:
-            async with player._coordinator.hold():
-                held.set()
-                await release.wait()
-
-        task = asyncio.create_task(holder())
-        self.addCleanup(task.cancel)
-        await asyncio.wait_for(held.wait(), 2)
-        return release

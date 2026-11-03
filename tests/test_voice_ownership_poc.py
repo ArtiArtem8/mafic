@@ -1,8 +1,8 @@
-"""Deterministic proof that one guild keeps one authoritative voice owner.
+"""Deterministic tests for one guild's voice ownership.
 
 Each scenario blocks one generation at a known await point with an
-``asyncio.Event`` and then lets the replacement run. The barrier is what makes
-the ordering a proof rather than a timing guess.
+``asyncio.Event`` and then lets the replacement run. Each barrier makes the
+tested ordering deterministic instead of relying on timing.
 """
 
 # pyright: reportPrivateUsage=false
@@ -184,8 +184,8 @@ class FakeNode:
             await self.release_destroy.wait()
 
 
-class VoiceOwnershipTests(IsolatedAsyncioTestCase):
-    """One guild, two generations, every transition driven by a barrier."""
+class VoiceTestCase(IsolatedAsyncioTestCase):
+    """Shared, isolated client, guild and node for voice lifecycle tests."""
 
     def setUp(self) -> None:
         """Install a private client, guild and node for each test."""
@@ -193,8 +193,6 @@ class VoiceOwnershipTests(IsolatedAsyncioTestCase):
         self.guild = FakeGuild(self.client)
         self.node = FakeNode()
         self.enterContext(patch.object(NodePool, "nodes", [self.node]))
-
-    # --- fixtures ---------------------------------------------------------
 
     def make_player(self) -> Player[Client]:
         """Build a real Player whose guild is the fake cache owner."""
@@ -219,8 +217,8 @@ class VoiceOwnershipTests(IsolatedAsyncioTestCase):
         player._node_player_ready_event.set()
         await player.connect(timeout=2, reconnect=True)
 
-    async def connected(self) -> Player[Client]:
-        """Return a registered, connected and node-bound owner."""
+    async def bound_player(self) -> Player[Client]:
+        """Return a registered, claimed and node-bound player."""
         player = self.make_player()
         self.register(player)
         await self.connect(player)
@@ -242,11 +240,13 @@ class VoiceOwnershipTests(IsolatedAsyncioTestCase):
         await asyncio.wait_for(held.wait(), 2)
         return release
 
-    # --- scenarios --------------------------------------------------------
+
+class VoiceOwnershipTests(VoiceTestCase):
+    """One guild, two generations, every transition driven by a barrier."""
 
     async def test_single_generation_joins_and_leaves(self) -> None:
         """The baseline: one generation owns the guild and retires cleanly."""
-        player = await self.connected()
+        player = await self.bound_player()
         self.assertIs(self.guild.voice_client, player)
         self.assertEqual(self.guild.calls, ["join"])
 
@@ -264,7 +264,7 @@ class VoiceOwnershipTests(IsolatedAsyncioTestCase):
         removal has to be gated by an identity check in the same synchronous
         block. The negative control below shows what the base method would do.
         """
-        first = await self.connected()
+        first = await self.bound_player()
         second = self.make_player()
         self.register(second)
         await self.connect(second)
@@ -278,7 +278,7 @@ class VoiceOwnershipTests(IsolatedAsyncioTestCase):
 
     async def test_replacement_during_lavalink_delete_keeps_the_new_owner(self) -> None:
         """A DELETE already in flight cannot destroy the next generation."""
-        first = await self.connected()
+        first = await self.bound_player()
         self.node.block_destroy = True
 
         teardown = asyncio.create_task(first.disconnect(force=True))
@@ -303,7 +303,7 @@ class VoiceOwnershipTests(IsolatedAsyncioTestCase):
 
     async def test_replacement_while_leaving_keeps_the_join_order(self) -> None:
         """A claim during change_voice_state(None) cannot invert the two sends."""
-        first = await self.connected()
+        first = await self.bound_player()
         self.guild.block_leave = True
 
         teardown = asyncio.create_task(first.disconnect(force=True))
@@ -326,7 +326,7 @@ class VoiceOwnershipTests(IsolatedAsyncioTestCase):
         self,
     ) -> None:
         """A teardown queued behind the lane does nothing once superseded."""
-        first = await self.connected()
+        first = await self.bound_player()
         second = self.make_player()
         self.register(second)
         await self.connect(second)
@@ -344,6 +344,33 @@ class VoiceOwnershipTests(IsolatedAsyncioTestCase):
         self.assertNotIn("leave", self.guild.calls)
         self.assertIs(self.guild.voice_client, second)
         self.assertEqual(self.node.players, [second])
+
+    async def test_replacement_while_waiting_for_voice_lock_skips_delete(self) -> None:
+        """A claim during the voice-lock wait prevents the old DELETE."""
+        first = await self.bound_player()
+        await first._voice_update_lock.acquire()
+        entered = Event()
+        teardown_voice = first._teardown_voice
+
+        async def observe_teardown(player: Player[Client]) -> None:
+            self.assertIs(player, first)
+            entered.set()
+            await teardown_voice()
+
+        with patch.object(Player, "_teardown_voice", new=observe_teardown):
+            teardown = asyncio.create_task(first.disconnect(force=True))
+            try:
+                await asyncio.wait_for(entered.wait(), 2)
+                replacement = self.make_player()
+                replacement._take_ownership()
+            finally:
+                first._voice_update_lock.release()
+            await asyncio.wait_for(teardown, 2)
+
+        self.assertEqual(self.node.destroy_calls, 0)
+        self.assertNotIn("leave", self.guild.gateway)
+        self.assertIs(replacement._coordinator.owner, replacement)
+        self.assertIsNone(self.node.get_player(GUILD_ID))
 
     async def test_reconnect_after_cancelled_connect_keeps_one_owner(self) -> None:
         """A cancelled connect leaves a claim the replacement can take over."""

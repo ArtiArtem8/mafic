@@ -196,8 +196,8 @@ def interleavings(
 
     Each source keeps its own internal order, which is what per-actor program
     order means: one actor cannot reorder its own operations, but two actors
-    interleave freely. Enumerating the merges covers every scheduler decision
-    that can reorder two concurrent generations.
+    interleave freely. The merges cover the two supplied operation sequences;
+    they do not model intermediate await points or verify the implementation.
     """
     left = list(first)
     right = list(second)

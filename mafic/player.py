@@ -402,11 +402,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
             _log.debug("Received websocket closed event: %s", event)
             self.client.dispatch("websocket_closed", event)
         elif data["type"] == "TrackStartEvent":
-            track = (
-                self._current
-                if self.node.version == 3
-                else Track.from_data_with_info(cast(TrackWithInfo, data.get("track")))
-            )
+            track = self._track_from_event(data)
 
             if track is None:
                 _log.error(
@@ -419,11 +415,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
             _log.debug("Received track start event: %s", event)
             self._last_track = track
         elif data["type"] == "TrackEndEvent":
-            track = (
-                self._last_track
-                if self.node.version == 3
-                else Track.from_data_with_info(cast(TrackWithInfo, data.get("track")))
-            )
+            track = self._track_from_event(data)
 
             if track is None:
                 _log.error(
@@ -439,11 +431,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
                 track, replaced=data["reason"] in ("REPLACED", "replaced")
             )
         elif data["type"] == "TrackExceptionEvent":
-            track = (
-                self._current
-                if self.node.version == 3
-                else Track.from_data_with_info(cast(TrackWithInfo, data.get("track")))
-            )
+            track = self._track_from_event(data)
 
             if track is None:
                 _log.error(
@@ -456,11 +444,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
             self.client.dispatch("track_exception", event)
             _log.debug("Received track exception event: %s", event)
         elif data["type"] == "TrackStuckEvent":
-            track = (
-                self._current
-                if self.node.version == 3
-                else Track.from_data_with_info(cast(TrackWithInfo, data.get("track")))
-            )
+            track = self._track_from_event(data)
 
             if track is None:
                 _log.error(
@@ -477,6 +461,14 @@ class Player(VoiceProtocol, Generic[ClientT]):
 
             event_type = cast(str, data["type"])
             _log.warning("Unknown incoming event type %s", event_type)
+
+    def _track_from_event(self, data: EventPayload) -> Track | None:
+        """Resolve an event's track from the v4 payload or v3 player state."""
+        if self.node.version == 3:
+            return (
+                self._last_track if data["type"] == "TrackEndEvent" else self._current
+            )
+        return Track.from_data_with_info(cast(TrackWithInfo, data.get("track")))
 
     @staticmethod
     def _playback_id(track: Track | None) -> str | None:
@@ -576,6 +568,13 @@ class Player(VoiceProtocol, Generic[ClientT]):
 
         The guild lane orders this update against the remote effects of every
         other generation for the same guild.
+
+        This is called by the library and usually should not be called by the user.
+
+        Parameters
+        ----------
+        data:
+            The voice server update payload.
         """
         if self._coordinator.holds_lane():
             # Same inline-callback case as _dispatch_player_update.
@@ -592,15 +591,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
         self._voice_server_update_event.set()
 
     async def _apply_voice_server_update(self, data: VoiceServerUpdatePayload) -> None:
-        """Apply a voice server update while the caller holds the guild lane.
-
-        This is called by the library and usually should not be called by the user.
-
-        Parameters
-        ----------
-        data:
-            The voice server update payload.
-        """
+        """Apply a voice server update while the caller holds the guild lane."""
         async with self._voice_update_lock:
             # The lane does not protect against a synchronous claim: a newer
             # generation can appear while this callback waits for the lock, or
@@ -694,8 +685,6 @@ class Player(VoiceProtocol, Generic[ClientT]):
                 "from a previous generation may remove this player.",
                 extra={"guild": self._guild_id},
             )
-        # Every exit path below that is not a success must release the guild,
-        # so the failure is decided first and compensated once, afterwards.
         failure: BaseException | None = None
         try:
             async with asyncio.timeout(timeout):
@@ -710,40 +699,40 @@ class Player(VoiceProtocol, Generic[ClientT]):
                     else:
                         failure = PlayerNotConnected()
 
-            if failure is None:
-                futures = [
-                    self._voice_state_update_event.wait(),
-                    self._voice_server_update_event.wait(),
-                    self._node_player_ready_event.wait(),
-                ]
-                ensured = [asyncio.ensure_future(fut) for fut in futures]
-                try:
-                    _, pending = await asyncio.wait(
-                        ensured, timeout=timeout, return_when=asyncio.ALL_COMPLETED
-                    )
-                finally:
-                    # asyncio.wait leaves the waiters it timed out on pending;
-                    # an orphaned waiter keeps the player and its events alive.
-                    for waiter in ensured:
-                        if not waiter.done():
-                            waiter.cancel()
-                    await asyncio.gather(*ensured, return_exceptions=True)
-
-                if len(pending) != 0:
-                    failure = asyncio.TimeoutError()
+            if failure is None and not await self._wait_for_voice_events(timeout):
+                failure = asyncio.TimeoutError()
         except BaseException as error:
             await self._compensate_failed_connect(error)
             raise
 
         # Readiness can finish after another generation claimed the guild.
-        # Returning success would hand the caller a player that owns neither
-        # registry any more.
         if failure is None and self._superseded():
             failure = PlayerNotConnected()
-
         if failure is not None:
             await self._compensate_failed_connect(failure)
             raise failure
+
+    async def _wait_for_voice_events(self, timeout: float) -> bool:
+        """Wait for Discord and Lavalink readiness, retiring every waiter."""
+        waiters = [
+            asyncio.create_task(event.wait())
+            for event in (
+                self._voice_state_update_event,
+                self._voice_server_update_event,
+                self._node_player_ready_event,
+            )
+        ]
+        try:
+            _, pending = await asyncio.wait(
+                waiters, timeout=timeout, return_when=asyncio.ALL_COMPLETED
+            )
+        finally:
+            for waiter in waiters:
+                if not waiter.done():
+                    waiter.cancel()
+            await asyncio.gather(*waiters, return_exceptions=True)
+
+        return not pending
 
     async def _compensate_failed_connect(self, error: BaseException) -> None:
         """Undo a failed connect without disturbing a newer owner.
@@ -964,6 +953,10 @@ class Player(VoiceProtocol, Generic[ClientT]):
             extra={"guild": self._guild_id},
         )
         async with self._voice_update_lock:
+            # A claim can happen while this teardown waits for the voice lock.
+            if self._superseded():
+                self._detach_local()
+                return
             node = self._node
             # Either registry may already belong to someone else: a foreign
             # protocol can occupy the Discord slot, and a restore may have
@@ -1044,7 +1037,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
         _log.debug("Remote effect failure traceback", exc_info=error)
 
     def _take_ownership(self) -> None:
-        """Claim this guild's ownership lane for this instance."""
+        """Claim a new ownership generation for this instance."""
         self._ownership_epoch = self._coordinator.claim(self)
 
     def _superseded(self) -> bool:

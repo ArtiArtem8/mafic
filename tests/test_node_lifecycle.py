@@ -146,6 +146,8 @@ class NodeLifecycleTests(IsolatedAsyncioTestCase):
         guild = Mock(spec=Guild, id=1)
         guild.change_voice_state = AsyncMock()
         channel = Mock(spec=VoiceChannel, id=10, guild=guild)
+        channel._get_voice_client_key.return_value = (1, None)
+        self.client._connection = Mock()
         player = Player(
             cast("Client", self.client),
             cast("VoiceChannel", channel),

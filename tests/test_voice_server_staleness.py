@@ -7,45 +7,28 @@ from __future__ import annotations
 import asyncio
 from asyncio import Event
 from typing import TYPE_CHECKING, cast
-from unittest import IsolatedAsyncioTestCase
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
-from mafic.__libraries import Client, VoiceChannel
-from mafic.player import Player
 from mafic.pool import NodePool
 
 from .test_player_update import player_payload
-from .test_voice_ownership_poc import (
-    CHANNEL_ID,
-    GUILD_ID,
-    FakeClient,
-    FakeGuild,
-    FakeNode,
-)
+from .test_voice_ownership_poc import GUILD_ID, FakeNode, VoiceTestCase
 
 if TYPE_CHECKING:
-    from mafic.__libraries import VoiceServerUpdatePayload
+    from mafic.__libraries import Client, VoiceServerUpdatePayload
     from mafic.node import Node
+    from mafic.player import Player
 
 ENDPOINT = "voice.example.com"
 
 
-class VoiceServerStalenessTests(IsolatedAsyncioTestCase):
+class VoiceServerStalenessTests(VoiceTestCase):
     """A synchronous claim must win against any awaiting callback."""
 
     def setUp(self) -> None:
-        """Install private fakes so tests never share class state."""
-        self.client = FakeClient()
-        self.guild = FakeGuild(self.client)
-        self.node = FakeNode()
+        """Add a second target node to the shared isolated fixture."""
+        super().setUp()
         self.target = FakeNode("B")
-        self.enterContext(patch.object(NodePool, "nodes", [self.node]))
-
-    def make_player(self) -> Player[Client]:
-        """Build a real Player bound to the fake guild and client."""
-        channel = Mock(spec=VoiceChannel, id=CHANNEL_ID, guild=self.guild)
-        channel._get_voice_client_key.return_value = (GUILD_ID, None)
-        return Player(cast("Client", self.client), channel)
 
     def server_update(self, endpoint: str = ENDPOINT) -> VoiceServerUpdatePayload:
         """Build a voice server payload for the guild."""
@@ -57,11 +40,8 @@ class VoiceServerStalenessTests(IsolatedAsyncioTestCase):
     async def connected(self) -> Player[Client]:
         """Return a registered, claimed and node-bound owner."""
         player = self.make_player()
-        self.client._connection._add_voice_client(GUILD_ID, player)
-        player._voice_state_update_event.set()
-        player._voice_server_update_event.set()
-        player._node_player_ready_event.set()
-        await player.connect(timeout=2, reconnect=True)
+        self.register(player)
+        await self.connect(player)
         player._connected = True
         player._node = cast("Node[Client]", self.node)
         player._session_id = "discord-session"

@@ -151,6 +151,79 @@ class TrackEventMetadataTests(TestCase):
         self.assertIs(self.player.current, current)
 
 
+class LegacyTrackEventTests(TestCase):
+    """Lavalink v3 events obtain their tracks from the player."""
+
+    def test_events_use_current_track_except_for_end(self) -> None:
+        """A delayed end event refers to the last started track."""
+        cases: list[EventPayload] = [
+            {"op": "event", "type": "TrackStartEvent", "guildId": "1"},
+            {
+                "op": "event",
+                "type": "TrackEndEvent",
+                "guildId": "1",
+                "reason": "REPLACED",
+            },
+            {
+                "op": "event",
+                "type": "TrackExceptionEvent",
+                "guildId": "1",
+                "exception": {
+                    "message": None,
+                    "severity": "fault",
+                    "cause": "failure",
+                },
+            },
+            {
+                "op": "event",
+                "type": "TrackStuckEvent",
+                "guildId": "1",
+                "thresholdMs": 10_000,
+            },
+        ]
+        for payload in cases:
+            with self.subTest(event_type=payload["type"]):
+                player = make_player()
+                player._node = make_node(3)
+                dispatch = Mock()
+                player.client = cast("Client", SimpleNamespace(dispatch=dispatch))
+                current = Track.from_data_with_info(track_payload("current"))
+                last = Track.from_data_with_info(track_payload("previous"))
+                player._current = current
+                player._last_track = last
+
+                player.dispatch_event(payload)
+
+                if dispatch.call_args is None:
+                    self.fail("Player did not dispatch a track event.")
+                event = cast("TrackEvent", dispatch.call_args.args[1])
+                self.assertIs(
+                    event.track, last if payload["type"] == "TrackEndEvent" else current
+                )
+                self.assertIs(player.current, current)
+                if payload["type"] == "TrackStartEvent":
+                    self.assertIs(player._last_track, current)
+
+    def test_legacy_event_without_local_track_is_not_dispatched(self) -> None:
+        """An event without the corresponding local track is dropped."""
+        player = make_player()
+        player._node = make_node(3)
+        dispatch = Mock()
+        player.client = cast("Client", SimpleNamespace(dispatch=dispatch))
+
+        with self.assertLogs("mafic.player", level="ERROR"):
+            player.dispatch_event(
+                {
+                    "op": "event",
+                    "type": "TrackEndEvent",
+                    "guildId": "1",
+                    "reason": "FINISHED",
+                }
+            )
+
+        dispatch.assert_not_called()
+
+
 class LavalinkExceptionTests(TestCase):
     """Verify the stable Lavalink 4.2 exception contract."""
 

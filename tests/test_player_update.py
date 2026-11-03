@@ -158,6 +158,22 @@ class NodePlayerUpdateTests(IsolatedAsyncioTestCase):
 
         self.assertEqual(payload, {"track": {"encoded": None}})
 
+    async def test_v4_stop_forwards_an_explicit_user_data_copy(self) -> None:
+        """Explicit metadata accompanies a stop without sharing the caller's dict."""
+        metadata = {"request_id": "abc"}
+
+        payload = await self.update_payload(
+            make_node(4), {"track": None, "user_data": metadata}
+        )
+
+        self.assertEqual(
+            payload, {"track": {"encoded": None, "userData": {"request_id": "abc"}}}
+        )
+        track_data = payload.get("track")
+        if track_data is None:
+            self.fail("The stop payload did not contain a track.")
+        self.assertIsNot(track_data.get("userData"), metadata)
+
     async def test_v3_payload_remains_legacy(self) -> None:
         """Lavalink v3 keeps its existing top-level encodedTrack payload."""
         track = Track.from_data_with_info(track_payload())

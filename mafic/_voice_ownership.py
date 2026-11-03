@@ -114,12 +114,11 @@ class GuildVoiceCoordinator:
         self._remote_unknown += 1
 
     def require_lane(self) -> None:
-        """Fail loudly when an internal remote mutation bypasses the lane.
+        """Require the current task to hold this guild's lane.
 
-        This is the runtime half of the contract documented on Node.update,
-        Node.voice_update and Node.destroy: mafic's own mutation paths must be
-        inside the lane, and a future bypass trips here instead of silently
-        racing a teardown.
+        Internal helpers that require the lane call this before mutating remote
+        state. Direct Node.update, Node.voice_update and Node.destroy calls are
+        uncoordinated and remain the caller's responsibility.
         """
         if not self.holds_lane():
             msg = "This operation requires the guild lane."
