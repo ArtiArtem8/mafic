@@ -123,6 +123,18 @@ class RemoteOutcomeTests(IsolatedAsyncioTestCase):
 
         self.assertEqual(player._coordinator.remote_unknown, 0)
 
+    async def test_cancelled_partial_target_cleanup_is_unknown_and_propagates(
+        self,
+    ) -> None:
+        """A cancelled cleanup DELETE is unresolved, not a silent no-op."""
+        player = await self.connected()
+        self.node.destroy_error = asyncio.CancelledError()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await player._destroy_partial_target(cast("Node[Client]", self.node))
+
+        self.assertEqual(player._coordinator.remote_unknown, 1)
+
     async def test_unknown_outcome_is_visible_to_the_next_generation(self) -> None:
         """The unresolved state must outlive the generation that caused it."""
         player = await self.connected()

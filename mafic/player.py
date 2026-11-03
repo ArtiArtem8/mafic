@@ -1231,6 +1231,11 @@ class Player(VoiceProtocol, Generic[ClientT]):
         """Best-effort cleanup of an uncommitted target, preserving the owner."""
         try:
             await node.destroy(guild_id=self.guild.id)
+        except asyncio.CancelledError as error:
+            # The DELETE was already sent; cancelling the await does not
+            # cancel the request, so the outcome is unknown, not absent.
+            self._note_remote_failure(error)
+            raise
         except Exception as error:  # noqa: BLE001 - preserve the original error
             # Same unknown-outcome policy as every other remote effect.
             self._note_remote_failure(error)
