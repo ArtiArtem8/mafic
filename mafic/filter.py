@@ -817,25 +817,7 @@ class Filter:
 
     def __ior__(self, other: Filter) -> Self:
         """Merge two filters together, favouring attributes from other, in place."""
-        if not isinstance(
-            other, Filter
-        ):  # pyright: ignore[reportUnnecessaryIsInstance]
-            msg = f"Expected Filter instance, not {type(other)!r}"
-            raise TypeError(msg)
-
-        self.equalizer = other.equalizer or self.equalizer
-        self.karaoke = other.karaoke or self.karaoke
-        self.timescale = other.timescale or self.timescale
-        self.tremolo = other.tremolo or self.tremolo
-        self.vibrato = other.vibrato or self.vibrato
-        self.rotation = other.rotation or self.rotation
-        self.distortion = other.distortion or self.distortion
-        self.channel_mix = other.channel_mix or self.channel_mix
-        self.low_pass = other.low_pass or self.low_pass
-        self.volume = other.volume if other.volume is not None else self.volume
-        self.plugin_filters = other.plugin_filters or self.plugin_filters
-
-        return self
+        return self._merge_in_place(other, prefer_other=True)
 
     def __and__(self, other: Filter) -> Filter:
         """Merge two filters together, favouring attributes from self."""
@@ -861,23 +843,30 @@ class Filter:
 
     def __iand__(self, other: Filter) -> Self:
         """Merge two filters together, favouring attributes from self, in place."""
+        return self._merge_in_place(other, prefer_other=False)
+
+    def _merge_in_place(self, other: Filter, *, prefer_other: bool) -> Self:
+        """Merge into this filter using the selected operand as the priority."""
         if not isinstance(
             other, Filter
         ):  # pyright: ignore[reportUnnecessaryIsInstance]
             msg = f"Expected Filter instance, not {type(other)!r}"
             raise TypeError(msg)
 
-        self.equalizer = self.equalizer or other.equalizer
-        self.karaoke = self.karaoke or other.karaoke
-        self.timescale = self.timescale or other.timescale
-        self.tremolo = self.tremolo or other.tremolo
-        self.vibrato = self.vibrato or other.vibrato
-        self.rotation = self.rotation or other.rotation
-        self.distortion = self.distortion or other.distortion
-        self.channel_mix = self.channel_mix or other.channel_mix
-        self.low_pass = self.low_pass or other.low_pass
-        self.volume = self.volume if self.volume is not None else other.volume
-        self.plugin_filters = self.plugin_filters or other.plugin_filters
+        preferred, fallback = (other, self) if prefer_other else (self, other)
+        self.equalizer = preferred.equalizer or fallback.equalizer
+        self.karaoke = preferred.karaoke or fallback.karaoke
+        self.timescale = preferred.timescale or fallback.timescale
+        self.tremolo = preferred.tremolo or fallback.tremolo
+        self.vibrato = preferred.vibrato or fallback.vibrato
+        self.rotation = preferred.rotation or fallback.rotation
+        self.distortion = preferred.distortion or fallback.distortion
+        self.channel_mix = preferred.channel_mix or fallback.channel_mix
+        self.low_pass = preferred.low_pass or fallback.low_pass
+        self.volume = (
+            preferred.volume if preferred.volume is not None else fallback.volume
+        )
+        self.plugin_filters = preferred.plugin_filters or fallback.plugin_filters
 
         return self
 
