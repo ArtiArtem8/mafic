@@ -26,24 +26,25 @@ async def await_owned(task: Task[T], *, extra: Mapping[str, object] | None = Non
     carries the caller's logging context into that line.
     """
     cancelled: asyncio.CancelledError | None = None
-    while True:
+    while not task.done():
         try:
-            result = await asyncio.shield(task)
+            # wait() leaves the owned task alone when this caller is cancelled.
+            await asyncio.wait((task,))
         except asyncio.CancelledError as exc:
             if task.cancelled():
                 raise
             cancelled = exc
-            continue
-        except Exception:
-            if cancelled is None:
-                raise
-            _log.exception(
-                "Owned cleanup failed after caller cancellation.", extra=extra
-            )
-            raise cancelled from None
-        if cancelled is not None:
-            raise cancelled
-        return result
+
+    try:
+        result = task.result()
+    except Exception:
+        if cancelled is None:
+            raise
+        _log.exception("Owned cleanup failed after caller cancellation.", extra=extra)
+        raise cancelled from None
+    if cancelled is not None:
+        raise cancelled
+    return result
 
 
 __all__ = ("await_owned",)
