@@ -7,6 +7,11 @@ into one entry, with links to the original changes.
 
 ## November 3, 2026
 
+- Ordered internal voice operations per client and guild across player generations
+- Kept failed or cancelled remote mutations as unresolved when their outcome is
+  unknown; a late request may still take effect
+- Rechecked ownership after guild lookup and before teardown sends a player DELETE
+- Avoided duplicate asyncio error reports for cancelled cleanup waiters on Python 3.14
 - Added configurable `http_timeout` for internally created node sessions
   - `None` keeps aiohttp's real session defaults (`total=300`, `sock_connect=30`)
   - `ClientTimeout(total=None)` explicitly disables the total deadline
