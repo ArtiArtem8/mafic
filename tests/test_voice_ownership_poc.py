@@ -13,7 +13,7 @@ import asyncio
 from asyncio import Event
 from typing import TYPE_CHECKING, cast
 from unittest import IsolatedAsyncioTestCase
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from mafic.__libraries import Client, VoiceChannel, VoiceProtocol
 from mafic.player import Player
@@ -118,8 +118,8 @@ class FakeGuild:
 class FakeNode:
     """A node double that honours the identity-checked registry contract."""
 
-    def __init__(self) -> None:
-        self.label = "A"
+    def __init__(self, label: str = "A") -> None:
+        self.label = label
         self.version = 4
         self._players: dict[int, Player[Client]] = {}
         self.destroy_calls = 0
@@ -128,6 +128,7 @@ class FakeNode:
         self.events: list[str] = []
         self.destroy_error: BaseException | None = None
         self.update_error: BaseException | None = None
+        self.fetch_player: AsyncMock = AsyncMock(return_value=player_payload())
         self.voice_update_error: BaseException | None = None
         self.destroy_started = Event()
         self.release_destroy = Event()

@@ -579,6 +579,8 @@ class Player(VoiceProtocol, Generic[ClientT]):
         """
         if self._coordinator.holds_lane():
             # Same inline-callback case as _dispatch_player_update.
+            if self._superseded():
+                return
             await self._apply_voice_server_update(data)
             self._voice_server_update_event.set()
             return
@@ -600,7 +602,11 @@ class Player(VoiceProtocol, Generic[ClientT]):
             The voice server update payload.
         """
         async with self._voice_update_lock:
-            if self._disconnect_requested:
+            # The lane does not protect against a synchronous claim: a newer
+            # generation can appear while this callback waits for the lock, or
+            # during the REST preparation below. This check sits immediately
+            # before the registry write, with no await in between.
+            if self._disconnect_requested or self._superseded():
                 return
 
             current_node = self._node
@@ -628,7 +634,12 @@ class Player(VoiceProtocol, Generic[ClientT]):
             self._server_state = data
 
             if current_node is not None and selected_node is not current_node:
-                await self._transfer_to_unlocked(selected_node)
+                try:
+                    await self._transfer_to_unlocked(selected_node)
+                except PlayerNotConnected:
+                    # A newer generation claimed while the target was being
+                    # prepared; the partial target is already cleaned up.
+                    return
             else:
                 self._node = selected_node
                 selected_node.add_player(self._guild_id, self)
@@ -1179,7 +1190,11 @@ class Player(VoiceProtocol, Generic[ClientT]):
             await self._destroy_partial_target(node)
             raise
 
-        if self._disconnect_requested:
+        if self._disconnect_requested or self._superseded():
+            # The preparation above awaited REST calls, and a claim is
+            # synchronous, so the generation may have changed meanwhile.
+            # Never commit a transfer for a player that no longer owns the
+            # guild; the prepared target is cleaned up, not kept.
             await self._destroy_partial_target(node)
             raise PlayerNotConnected
 
@@ -1216,7 +1231,9 @@ class Player(VoiceProtocol, Generic[ClientT]):
         """Best-effort cleanup of an uncommitted target, preserving the owner."""
         try:
             await node.destroy(guild_id=self.guild.id)
-        except Exception:  # noqa: BLE001 - preserve the preparation failure
+        except Exception as error:  # noqa: BLE001 - preserve the original error
+            # Same unknown-outcome policy as every other remote effect.
+            self._note_remote_failure(error)
             _log.exception(
                 "Failed to clean up partial target node player.",
                 extra={"guild": self.guild.id, "node": node.label},
