@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 
 GUILD_ID = 1
 CHANNEL_ID = 10
+MOVE_CHANNEL_ID = 20
 
 
 class FakeConnection:
@@ -72,6 +73,12 @@ class FakeGuild:
         self.release_join = Event()
         self.block_join = False
         self.join_error: BaseException | None = None
+        self.gateway: list[str] = []
+        self.move_started = Event()
+        self.move_completed = Event()
+        self.release_move = Event()
+        self.block_move = False
+        self.leave_overlapped_move = False
 
     @property
     def voice_client(self) -> object | None:
@@ -83,11 +90,23 @@ class FakeGuild:
     ) -> None:
         """Record a gateway request, with optional holds and join failures."""
         if channel is None:
+            self.gateway.append("leave")
+            self.leave_overlapped_move = (
+                self.move_started.is_set() and not self.move_completed.is_set()
+            )
             self.calls.append("leave")
             if self.block_leave:
                 self.leave_started.set()
                 await self.release_leave.wait()
             return
+        if getattr(channel, "id", None) == MOVE_CHANNEL_ID:
+            self.gateway.append("move")
+            self.move_started.set()
+            if self.block_move:
+                await self.release_move.wait()
+            self.move_completed.set()
+            return
+        self.gateway.append("join")
         self.calls.append("join")
         self.join_started.set()
         if self.block_join:

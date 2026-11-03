@@ -635,7 +635,10 @@ class VoiceStateTests(IsolatedAsyncioTestCase):
                         await self.sent.wait()
                         waiting = asyncio.create_task(queued_move())
                         await queued.wait()
-                        await self.voice_state_update(20)
+                        # The active move owns the guild lane until its gateway
+                        # send returns, so the confirmation is delivered by
+                        # that send rather than from here; a callback issued
+                        # now would wait for the lane.
                         if cancel:
                             waiting.cancel()
                             with self.assertRaises(asyncio.CancelledError):
@@ -643,11 +646,13 @@ class VoiceStateTests(IsolatedAsyncioTestCase):
                         else:
                             with self.assertRaises(asyncio.TimeoutError):
                                 await waiting
-                        self.assertTrue(self.player._voice_state_update_event.is_set())
                         self.guild.change_voice_state.assert_awaited_once()
                         self.assertFalse(active.done())
                         release_request.set()
+                        # The active move must still complete with its own
+                        # confirmation after the queued caller left.
                         await active
+                        self.assertIs(self.player.channel, self.target)
                         await self.player.move_to(self.channel, timeout=1)
                 self.assertIs(self.player.channel, self.channel)
                 self.assertFalse(self.player._move_lock.locked())

@@ -65,6 +65,22 @@ _REJECTED_STATUSES = frozenset({400, 401, 403, 404, 405, 422})
 """Statuses that prove the server refused the request before applying it."""
 
 
+def _consume_teardown_result(task: asyncio.Task[None]) -> None:
+    """Retrieve a detached teardown result so asyncio does not warn about it.
+
+    A cancelled caller hands cleanup to the owned task and returns; this keeps
+    the task observed without making it an unmanaged background job.
+    """
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        _log.error(
+            "Detached voice teardown failed.",
+            exc_info=(type(error), error, error.__traceback__),
+        )
+
+
 def _is_unknown_outcome(error: BaseException) -> bool:
     """Whether a failed remote effect may still have been applied.
 
@@ -137,6 +153,9 @@ class Player(VoiceProtocol, Generic[ClientT]):
         # coordinator mints the generation this instance is compared against.
         self._coordinator = coordinator_for(client, self._guild_id)
         self._ownership_epoch = 0
+        # Set immediately before the gateway join is sent, so a cancellation
+        # can tell "nothing remote happened" from "it may already have".
+        self._join_sent = False
         self._session_id: str | None = None
         self._server_state: VoiceServerUpdatePayload | None = None
         self._connected: bool = False
@@ -316,6 +335,14 @@ class Player(VoiceProtocol, Generic[ClientT]):
 
     async def _dispatch_player_update(self) -> None:
         """Dispatch a player update to the node."""
+        if self._coordinator.holds_lane():
+            # A gateway callback delivered inside a move already runs in the
+            # lane. Re-acquiring it would deadlock, and no other remote effect
+            # can run while the caller holds it, so the ordering stands.
+            async with self._voice_update_lock:
+                await self._dispatch_player_update_unlocked()
+            return
+
         # Ordered against every other generation of this guild, so a create
         # cannot overtake a predecessor's still-running destroy.
         async with self._coordinator.hold(), self._voice_update_lock:
@@ -550,6 +577,12 @@ class Player(VoiceProtocol, Generic[ClientT]):
         The guild lane orders this update against the remote effects of every
         other generation for the same guild.
         """
+        if self._coordinator.holds_lane():
+            # Same inline-callback case as _dispatch_player_update.
+            await self._apply_voice_server_update(data)
+            self._voice_server_update_event.set()
+            return
+
         async with self._coordinator.hold():
             if self._superseded():
                 return
@@ -657,6 +690,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
             async with asyncio.timeout(timeout):
                 async with self._coordinator.hold():
                     if self._coordinator.is_current(self, self._ownership_epoch):
+                        self._join_sent = True
                         await self.channel.guild.change_voice_state(
                             channel=self.channel,
                             self_mute=self_mute,
@@ -690,6 +724,12 @@ class Player(VoiceProtocol, Generic[ClientT]):
             await self._compensate_failed_connect(error)
             raise
 
+        # Readiness can finish after another generation claimed the guild.
+        # Returning success would hand the caller a player that owns neither
+        # registry any more.
+        if failure is None and self._superseded():
+            failure = PlayerNotConnected()
+
         if failure is not None:
             await self._compensate_failed_connect(failure)
             raise failure
@@ -699,20 +739,35 @@ class Player(VoiceProtocol, Generic[ClientT]):
 
         ``Connectable.connect`` only compensates on :exc:`asyncio.TimeoutError`,
         so a gateway error or a cancellation would otherwise leave this instance
-        holding the Discord voice slot and the guild generation. On a cancellation
-        the compensation must not queue behind the guild lane, so it retires local
-        registrations synchronously and leaves any remote player to the next
-        :meth:`Node.sync_players`. Otherwise teardown is the same single-flight
-        task the library may await afterwards, so the dangerous work never runs
-        twice.
+        holding the Discord voice slot and the guild generation.
+
+        A cancellation is split by whether the gateway join was sent:
+
+        * before it, nothing remote can exist and only local registrations are
+          retired - a cancelled caller must not queue behind a busy lane;
+        * after it, the join, and possibly a Lavalink player, may already
+          exist. The teardown is then started in its owned single-flight task
+          and not awaited here, so the caller still unwinds promptly. Any later
+          :meth:`disconnect` or :meth:`wait_for_disconnect` joins that task,
+          and its failure is retrieved rather than left unobserved.
         """
+        if (
+            isinstance(error, asyncio.CancelledError)
+            and self._join_sent
+            and not self._superseded()
+        ):
+            task = self._start_teardown(force=True)
+            if task is not None:
+                task.add_done_callback(_consume_teardown_result)
+            return
+
         if (
             isinstance(error, asyncio.CancelledError)
             or self._ownership_epoch == 0
             or self._coordinator.owner is not self
         ):
-            # Cancelled, never claimed, or already superseded: only local
-            # registrations belong to this instance.
+            # Cancelled before the join, never claimed, or already superseded:
+            # only local registrations belong to this instance.
             self._detach_local()
             return
 
@@ -788,9 +843,20 @@ class Player(VoiceProtocol, Generic[ClientT]):
                 ):
                     return
 
-                self._voice_state_update_event.clear()
+                # JOIN, MOVE and LEAVE share Discord gateway opcode 4, so the
+                # send is ordered on the guild lane. The wait for its callback
+                # stays outside: on_voice_state_update must remain free to run,
+                # otherwise the move would wait for the update it blocks.
+                async with self._coordinator.hold():
+                    stale = self._disconnect_requested or self._superseded()
+                    if not stale:
+                        self._voice_state_update_event.clear()
+                        await self.guild.change_voice_state(channel=channel)
+                if stale:
+                    # Checked under the lane, immediately before the send.
+                    raise PlayerNotConnected
+
                 try:
-                    await self.guild.change_voice_state(channel=channel)
                     while True:
                         await self._voice_state_update_event.wait()
                         self._voice_state_update_event.clear()
@@ -815,20 +881,32 @@ class Player(VoiceProtocol, Generic[ClientT]):
         Concurrent calls share one teardown. Once disconnect starts, cancellation
         is propagated only after teardown completes.
         """
-        task = self._disconnect_task
+        task = self._start_teardown(force=force)
         if task is None:
-            if not force and self.guild.voice_client is not self:
-                return
-
-            # Handled by Discord
-            if self.client.is_closed():
-                return
-
-            self._disconnect_requested = True
-            self._connected = False
-            task = self._disconnect_task = asyncio.create_task(self._disconnect_voice())
+            return
 
         await await_owned(task, extra={"guild": self._guild_id})
+
+    def _start_teardown(self, *, force: bool = False) -> asyncio.Task[None] | None:
+        """Create the single-flight teardown task if one should run.
+
+        Returns the task that owns the teardown, whether it was created here or
+        by an earlier caller. ``None`` means there is nothing to do.
+        """
+        task = self._disconnect_task
+        if task is not None:
+            return task
+        if not force and self.guild.voice_client is not self:
+            return None
+
+        # Handled by Discord
+        if self.client.is_closed():
+            return None
+
+        self._disconnect_requested = True
+        self._connected = False
+        task = self._disconnect_task = asyncio.create_task(self._disconnect_voice())
+        return task
 
     @property
     def disconnect_started(self) -> bool:
