@@ -22,6 +22,7 @@ __all__ = (
     "NoCompatibleLibraries",
     "NoNodesAvailable",
     "NodeAlreadyConnected",
+    "NodeQuiesced",
     "PlayerException",
     "PlayerNotConnected",
     "TrackLoadException",
@@ -122,6 +123,14 @@ class PlayerNotConnected(PlayerException):
 
     def __init__(self) -> None:
         super().__init__("The player is not connected to a voice channel.")
+
+
+class NodeQuiesced(MaficException):
+    """A quiesced node refused to connect.
+
+    The node stopped its transport through :meth:`Node.quiesce` and keeps
+    only its REST API. Call :meth:`Node.close` before reconnecting.
+    """
 
 
 class NodeAlreadyConnected(MaficException):

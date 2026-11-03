@@ -214,6 +214,8 @@ class Node(Generic[ClientT]):
         "_close_task",
         "_closing",
         "_connect_task",
+        "_quiesce_task",
+        "_quiesced",
         "_heartbeat",
         "_host",
         "_http_timeout",
@@ -295,6 +297,9 @@ class Node(Generic[ClientT]):
 
         self._msg_tasks: set[Task[None]] = set()
         self._connect_task: Task[None] | None = None
+
+        self._quiesced = False
+        self._quiesce_task: Task[None] | None = None
 
         self._checked_version: bool = False
         self._version: int = 3
@@ -676,6 +681,9 @@ class Node(Generic[ClientT]):
             If the connection times out.
             You can change the timeout with the `timeout` parameter.
         """
+        if self._quiesced:
+            raise NodeQuiesced
+
         if (
             self._closing
             or (self._close_task is not None and not self._close_task.done())
@@ -695,6 +703,8 @@ class Node(Generic[ClientT]):
     ) -> Task[None]:
         if self._closing:
             raise NodeAlreadyConnected
+        if self._quiesced:
+            raise NodeQuiesced
         task = create_task(self._connect(backoff=backoff, player_cls=player_cls))
         self._connect_task = task
 
@@ -847,6 +857,48 @@ class Node(Generic[ClientT]):
                         extra={"label": self._label},
                     )
 
+    async def quiesce(self) -> None:
+        """Stop transport work while keeping the REST API usable.
+
+        The node becomes unavailable immediately, and a pending reconnect and
+        the current listener are cancelled and joined before the websocket is
+        closed. The HTTP session stays open so existing players can still be
+        transferred or deleted. Repeated calls share one operation, and a
+        caller cancellation is propagated only after it settles.
+
+        Quiesce never aborts the HTTP session: a reconnect that is stuck in
+        REST delays it. Bound the wait at the caller and use :meth:`close` to
+        abort an internally owned session when transport must stop at once.
+
+        A quiesced node refuses :meth:`connect` with :class:`NodeQuiesced`
+        until :meth:`close` resets it.
+
+        .. versionadded:: 2.12
+        """
+        task = self._quiesce_task
+        if task is None:
+            if self._quiesced or self._closing:
+                return
+            self._quiesced = True
+            self._mark_unavailable()
+            task = self._quiesce_task = create_task(self._quiesce())
+        if task is current_task():
+            return
+        await await_owned(task)
+
+    async def _quiesce(self) -> None:
+        """Perform one planned transport shutdown and keep the session."""
+        try:
+            reconnect = self._connect_task
+            if reconnect is not None and not reconnect.done():
+                reconnect.cancel()
+            if reconnect is not None:
+                await gather(reconnect, return_exceptions=True)
+            self._cancel_transport_tasks()
+            await self._disconnect()
+        finally:
+            self._quiesce_task = None
+
     async def _abort_http(self) -> None:
         """Close an internally owned session so requests cannot hang shutdown."""
         if not self._owns_session:
@@ -907,6 +959,7 @@ class Node(Generic[ClientT]):
             self.cleanup()
             self._closing = False
             self._close_task = None
+            self._quiesced = False
             _log.info(
                 "Node %s is now closed.",
                 self._label,
@@ -951,7 +1004,7 @@ class Node(Generic[ClientT]):
 
         # Cancellation deliberately bypasses recovery (Node.close owns shutdown).
         self._mark_unavailable()
-        if self._closing:
+        if self._closing or self._quiesced:
             return
         self._client.dispatch("node_unavailable", self)
         await self._disconnect()
