@@ -24,6 +24,7 @@ class FakeNode:
         self.label = label
         self._players: dict[int, Player[Client]] = {}
         self.connect = AsyncMock()
+        self.quiesce = AsyncMock()
         self.close = AsyncMock()
         self.destroy = AsyncMock()
 
@@ -113,6 +114,43 @@ class NodeRemovalTests(IsolatedAsyncioTestCase):
 
         first_disconnect.assert_awaited_once_with(force=True)
         second_disconnect.assert_awaited_once_with(force=True)
+        self.node.close.assert_awaited_once()
+        self.assertNotIn("A", self.nodes)
+
+    async def test_quiesce_completes_before_the_player_snapshot(self) -> None:
+        """A player registered while the transport stops is still removed."""
+        late: Player[Client] | None = None
+
+        async def quiesce() -> None:
+            nonlocal late
+            late = self.make_player(2, self.node)
+            late.disconnect = AsyncMock()
+
+        self.node.quiesce = AsyncMock(side_effect=quiesce)
+
+        await self.pool.remove_node(
+            cast("Node[Client]", self.node), transfer_players=False
+        )
+
+        if late is None:
+            self.fail("quiesce did not register the late player")
+        disconnect = cast("Mock", late.disconnect)
+        disconnect.assert_awaited_once_with(force=True)
+        self.assertIsNone(self.node.get_player(2))
+
+    async def test_failed_quiesce_closes_the_node_without_teardown(self) -> None:
+        """An unstopped transport never proceeds to player teardown."""
+        player = self.make_player(1, self.node)
+        disconnect = AsyncMock()
+        player.disconnect = disconnect
+        self.node.quiesce = AsyncMock(side_effect=RuntimeError("quiesce failed"))
+
+        with self.assertRaisesRegex(RuntimeError, "quiesce failed"):
+            await self.pool.remove_node(
+                cast("Node[Client]", self.node), transfer_players=False
+            )
+
+        disconnect.assert_not_awaited()
         self.node.close.assert_awaited_once()
         self.assertNotIn("A", self.nodes)
 

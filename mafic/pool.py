@@ -238,7 +238,10 @@ class NodePool(Generic[ClientT]):
 
         The node leaves the pool before player teardown. Every player operation
         is attempted even when another player fails, and the node is always
-        closed afterwards. Concurrent calls for the same node instance share one
+        closed afterwards. The transport is quiesced before the player snapshot,
+        so REST stays available for transfers and deletes while no reconnect can
+        register another player into an already-removed node. Concurrent calls
+        for the same node instance share one
         owned operation; a caller cancellation is propagated only after it
         settles. The first caller's ``transfer_players`` value owns that
         operation. A replacement node registered under the same label is a
@@ -278,8 +281,13 @@ class NodePool(Generic[ClientT]):
         """Own one removal from pool deletion through node close."""
         if self._nodes.get(node.label) is node:
             self._nodes.pop(node.label, None)
-        players = tuple(node.players)
         try:
+            # Stop transport first so no reconnect can resurrect players
+            # while this removal tears them down.
+            await node.quiesce()
+            # Snapshot after quiesce: a sync that completed while the
+            # transport was stopping may have registered new players.
+            players = tuple(node.players)
             if transfer_players:
                 await self._transfer_players(node, players)
             else:
