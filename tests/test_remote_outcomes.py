@@ -10,7 +10,7 @@ from unittest import IsolatedAsyncioTestCase
 from unittest.mock import Mock, patch
 
 from mafic.__libraries import Client, VoiceChannel
-from mafic.errors import HTTPNotFound
+from mafic.errors import HTTPBadRequest, HTTPNotFound
 from mafic.player import Player
 from mafic.pool import NodePool
 
@@ -54,6 +54,12 @@ class RemoteOutcomeTests(IsolatedAsyncioTestCase):
         self.node.add_player(GUILD_ID, player)
         player._node = cast("Node[Client]", self.node)
         player._connected = True
+        player._session_id = "discord-session"
+        player._server_state = {
+            "guild_id": GUILD_ID,
+            "endpoint": "voice.example.com",
+            "token": "token",
+        }
         return player
 
     async def test_unknown_delete_outcome_is_recorded(self) -> None:
@@ -74,6 +80,46 @@ class RemoteOutcomeTests(IsolatedAsyncioTestCase):
         self.node.destroy_error = HTTPNotFound("gone")
 
         await player.disconnect(force=True)
+
+        self.assertEqual(player._coordinator.remote_unknown, 0)
+
+    async def test_patch_timeout_is_recorded_as_unknown(self) -> None:
+        """A PATCH without a response may still be applied later."""
+        player = await self.connected()
+        self.node.update_error = asyncio.TimeoutError()
+
+        with self.assertRaises(asyncio.TimeoutError):
+            await player.update(volume=10)
+
+        self.assertEqual(player._coordinator.remote_unknown, 1)
+
+    async def test_cancelled_patch_is_recorded_and_propagates(self) -> None:
+        """Cancelling the await does not cancel a request already sent."""
+        player = await self.connected()
+        self.node.update_error = asyncio.CancelledError()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await player.update(volume=10)
+
+        self.assertEqual(player._coordinator.remote_unknown, 1)
+
+    async def test_voice_patch_failure_is_recorded_as_unknown(self) -> None:
+        """The voice update is a remote effect and is tracked like the others."""
+        player = await self.connected()
+        self.node.voice_update_error = asyncio.TimeoutError()
+
+        with self.assertRaises(asyncio.TimeoutError):
+            await player._dispatch_player_update()
+
+        self.assertEqual(player._coordinator.remote_unknown, 1)
+
+    async def test_rejected_patch_is_not_recorded_as_unknown(self) -> None:
+        """A 400 proves the server refused the PATCH."""
+        player = await self.connected()
+        self.node.update_error = HTTPBadRequest("bad payload")
+
+        with self.assertRaises(HTTPBadRequest):
+            await player.update(volume=10)
 
         self.assertEqual(player._coordinator.remote_unknown, 0)
 

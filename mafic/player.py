@@ -23,7 +23,12 @@ from .__libraries import (
     VoiceProtocol,
 )
 from ._voice_ownership import coordinator_for
-from .errors import HTTPNotFound, NoNodesAvailable, PlayerNotConnected
+from .errors import (
+    HTTPException,
+    HTTPNotFound,
+    NoNodesAvailable,
+    PlayerNotConnected,
+)
 from .events import *
 from .filter import Filter
 from .pool import NodePool
@@ -54,6 +59,25 @@ if TYPE_CHECKING:
 
 _log = getLogger(__name__)
 __all__ = ("Player",)
+
+
+_REJECTED_STATUSES = frozenset({400, 401, 403, 404, 405, 422})
+"""Statuses that prove the server refused the request before applying it."""
+
+
+def _is_unknown_outcome(error: BaseException) -> bool:
+    """Whether a failed remote effect may still have been applied.
+
+    Only a refusal proves the effect did not happen. Everything else is
+    undecided: 408 and 5xx may have run downstream, and a timeout, dropped
+    transport or cancellation has no response at all, so the request may still
+    reach Lavalink later.
+    """
+    if isinstance(error, HTTPException):
+        return error.status not in _REJECTED_STATUSES
+    return True
+
+
 _PLAYBACK_ID_KEY = "__mafic_playback_id"
 
 
@@ -325,12 +349,16 @@ class Player(VoiceProtocol, Generic[ClientT]):
             _log.debug("Received player update before channel was set.")
             return
 
-        await node.voice_update(
-            guild_id=self._guild_id,
-            session_id=session_id,
-            data=server_state,
-            channel_id=int(channel.id),
-        )
+        try:
+            await node.voice_update(
+                guild_id=self._guild_id,
+                session_id=session_id,
+                data=server_state,
+                channel_id=int(channel.id),
+            )
+        except BaseException as error:
+            self._note_remote_failure(error)
+            raise
 
     def dispatch_event(self, data: EventPayload) -> None:
         """Dispatch an event to the player.
@@ -622,29 +650,79 @@ class Player(VoiceProtocol, Generic[ClientT]):
                 "from a previous generation may remove this player.",
                 extra={"guild": self._guild_id},
             )
-        async with asyncio.timeout(timeout):
-            async with self._coordinator.hold():
-                if not self._coordinator.is_current(self, self._ownership_epoch):
-                    raise PlayerNotConnected
-                await self.channel.guild.change_voice_state(
-                    channel=self.channel,
-                    self_mute=self_mute,
-                    self_deaf=self_deaf,
-                )
-        futures = [
-            self._voice_state_update_event.wait(),
-            self._voice_server_update_event.wait(),
-            self._node_player_ready_event.wait(),
-        ]
+        # Every exit path below that is not a success must release the guild,
+        # so the failure is decided first and compensated once, afterwards.
+        failure: BaseException | None = None
+        try:
+            async with asyncio.timeout(timeout):
+                async with self._coordinator.hold():
+                    if self._coordinator.is_current(self, self._ownership_epoch):
+                        await self.channel.guild.change_voice_state(
+                            channel=self.channel,
+                            self_mute=self_mute,
+                            self_deaf=self_deaf,
+                        )
+                    else:
+                        failure = PlayerNotConnected()
 
-        ensured = [asyncio.ensure_future(fut) for fut in futures]
-        _, pending = await asyncio.wait(
-            ensured, timeout=timeout, return_when=asyncio.ALL_COMPLETED
-        )
+            if failure is None:
+                futures = [
+                    self._voice_state_update_event.wait(),
+                    self._voice_server_update_event.wait(),
+                    self._node_player_ready_event.wait(),
+                ]
+                ensured = [asyncio.ensure_future(fut) for fut in futures]
+                try:
+                    _, pending = await asyncio.wait(
+                        ensured, timeout=timeout, return_when=asyncio.ALL_COMPLETED
+                    )
+                finally:
+                    # asyncio.wait leaves the waiters it timed out on pending;
+                    # an orphaned waiter keeps the player and its events alive.
+                    for waiter in ensured:
+                        if not waiter.done():
+                            waiter.cancel()
+                    await asyncio.gather(*ensured, return_exceptions=True)
 
-        if len(pending) != 0:
+                if len(pending) != 0:
+                    failure = asyncio.TimeoutError()
+        except BaseException as error:
+            await self._compensate_failed_connect(error)
+            raise
+
+        if failure is not None:
+            await self._compensate_failed_connect(failure)
+            raise failure
+
+    async def _compensate_failed_connect(self, error: BaseException) -> None:
+        """Undo a failed connect without disturbing a newer owner.
+
+        ``Connectable.connect`` only compensates on :exc:`asyncio.TimeoutError`,
+        so a gateway error or a cancellation would otherwise leave this instance
+        holding the Discord voice slot and the guild generation. On a cancellation
+        the compensation must not queue behind the guild lane, so it retires local
+        registrations synchronously and leaves any remote player to the next
+        :meth:`Node.sync_players`. Otherwise teardown is the same single-flight
+        task the library may await afterwards, so the dangerous work never runs
+        twice.
+        """
+        if (
+            isinstance(error, asyncio.CancelledError)
+            or self._ownership_epoch == 0
+            or self._coordinator.owner is not self
+        ):
+            # Cancelled, never claimed, or already superseded: only local
+            # registrations belong to this instance.
+            self._detach_local()
+            return
+
+        try:
             await self.disconnect(force=True)
-            raise asyncio.TimeoutError
+        except Exception:  # noqa: BLE001 - preserve the original connect failure
+            _log.exception(
+                "Failed to clean up after an unsuccessful connect.",
+                extra={"guild": self._guild_id},
+            )
 
     async def move_to(
         self,
@@ -821,17 +899,16 @@ class Player(VoiceProtocol, Generic[ClientT]):
                         "Player was already destroyed on the node.",
                         extra={"guild": self.guild.id, "node": node.label},
                     )
-                except Exception:  # noqa: BLE001 - leave/cleanup must continue
+                except asyncio.CancelledError as error:
+                    # The DELETE was already sent; cancelling the await does
+                    # not cancel the request.
+                    self._note_remote_failure(error)
+                    raise
+                except Exception as error:  # noqa: BLE001 - leave must continue
                     # A timeout or lost connection leaves the server state
                     # unknown: the DELETE may still be applied later. Record
                     # it instead of pretending the player is gone.
-                    self._coordinator.mark_remote_unknown()
-                    _log.warning(
-                        "Player destroy outcome is unknown; the remote player "
-                        "may reappear and a late DELETE can still apply.",
-                        extra={"guild": self.guild.id, "node": node.label},
-                    )
-                    _log.debug("Player destroy failure traceback", exc_info=True)
+                    self._note_remote_failure(error)
                 finally:
                     self._node = None
 
@@ -864,6 +941,18 @@ class Player(VoiceProtocol, Generic[ClientT]):
         self._paused = False
         self._ping = 0
         self._connected = False
+
+    def _note_remote_failure(self, error: BaseException) -> None:
+        """Record a remote effect whose outcome the server did not confirm."""
+        if not _is_unknown_outcome(error):
+            return
+        self._coordinator.mark_remote_unknown()
+        _log.warning(
+            "A remote player effect ended without a server response; its "
+            "outcome is unknown and a late request may still apply.",
+            extra={"guild": self._guild_id},
+        )
+        _log.debug("Remote effect failure traceback", exc_info=error)
 
     def _take_ownership(self) -> None:
         """Claim this guild's ownership lane for this instance."""
@@ -1007,7 +1096,8 @@ class Player(VoiceProtocol, Generic[ClientT]):
                 pause=snapshot["paused"],
                 filter=snapshot_filter,
             )
-        except (Exception, asyncio.CancelledError):
+        except (Exception, asyncio.CancelledError) as error:
+            self._note_remote_failure(error)
             await self._destroy_partial_target(node)
             raise
 
@@ -1037,7 +1127,8 @@ class Player(VoiceProtocol, Generic[ClientT]):
                 asyncio.create_task(old_node.destroy(guild_id=self.guild.id)),
                 extra={"guild": self.guild.id, "node": old_node.label},
             )
-        except Exception:  # noqa: BLE001 - committed migration, cleanup only
+        except Exception as error:  # noqa: BLE001 - committed migration
+            self._note_remote_failure(error)
             _log.exception(
                 "Failed to destroy old node player after transfer.",
                 extra={"guild": self.guild.id, "node": old_node.label},
@@ -1219,17 +1310,21 @@ class Player(VoiceProtocol, Generic[ClientT]):
                 # lane; a PATCH after that DELETE would resurrect the player.
                 if self._disconnect_requested or self._superseded():
                     raise PlayerNotConnected
-                data = await node.update(
-                    guild_id=self._guild_id,
-                    track=track,
-                    position=position,
-                    end_time=end_time,
-                    volume=volume,
-                    pause=pause,
-                    filter=filter,
-                    no_replace=not replace,
-                    user_data=user_data,
-                )
+                try:
+                    data = await node.update(
+                        guild_id=self._guild_id,
+                        track=track,
+                        position=position,
+                        end_time=end_time,
+                        volume=volume,
+                        pause=pause,
+                        filter=filter,
+                        no_replace=not replace,
+                        user_data=user_data,
+                    )
+                except BaseException as error:
+                    self._note_remote_failure(error)
+                    raise
             if (
                 self._node is not node
                 or self._disconnect_requested

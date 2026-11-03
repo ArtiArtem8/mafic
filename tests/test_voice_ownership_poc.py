@@ -68,6 +68,10 @@ class FakeGuild:
         self.leave_started = Event()
         self.release_leave = Event()
         self.block_leave = False
+        self.join_started = Event()
+        self.release_join = Event()
+        self.block_join = False
+        self.join_error: BaseException | None = None
 
     @property
     def voice_client(self) -> object | None:
@@ -77,7 +81,7 @@ class FakeGuild:
     async def change_voice_state(
         self, *, channel: object = None, **_kwargs: object
     ) -> None:
-        """Record a gateway request, optionally holding the leave call."""
+        """Record a gateway request, with optional holds and join failures."""
         if channel is None:
             self.calls.append("leave")
             if self.block_leave:
@@ -85,6 +89,11 @@ class FakeGuild:
                 await self.release_leave.wait()
             return
         self.calls.append("join")
+        self.join_started.set()
+        if self.block_join:
+            await self.release_join.wait()
+        if self.join_error is not None:
+            raise self.join_error
 
 
 class FakeNode:
@@ -99,6 +108,8 @@ class FakeNode:
         self.voice_update_calls = 0
         self.events: list[str] = []
         self.destroy_error: BaseException | None = None
+        self.update_error: BaseException | None = None
+        self.voice_update_error: BaseException | None = None
         self.destroy_started = Event()
         self.release_destroy = Event()
         self.block_destroy = False
@@ -131,12 +142,16 @@ class FakeNode:
         """Record a PATCH and answer with a well-formed player payload."""
         self.update_calls += 1
         self.events.append("patch")
+        if self.update_error is not None:
+            raise self.update_error
         return player_payload()
 
     async def voice_update(self, **_kwargs: object) -> None:
         """Record a voice PATCH without a transport."""
         self.voice_update_calls += 1
         self.events.append("voice_patch")
+        if self.voice_update_error is not None:
+            raise self.voice_update_error
 
     async def destroy(self, **_kwargs: object) -> None:
         """Stand in for DELETE /sessions/{id}/players/{guild}, with a barrier."""
