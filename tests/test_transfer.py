@@ -582,15 +582,16 @@ class NodeTransferTests(IsolatedAsyncioTestCase):
                     },
                 )
 
+                pool = Mock(get_node=Mock())
                 with (
-                    patch("mafic.player.NodePool.get_node") as get_node,
+                    patch("mafic.player.pool_for", return_value=pool),
                     patch.object(Node, "voice_update", AsyncMock()) as voice_update,
                 ):
                     await self.player.on_voice_server_update(server_data)
                     await self.player.on_voice_state_update(state_data)
                     await self.player._dispatch_player_update()
 
-                get_node.assert_not_called()
+                pool.get_node.assert_not_called()
                 voice_update.assert_not_awaited()
                 self.assertIs(self.player.assigned_node, owner)
                 if completed:
@@ -956,7 +957,10 @@ class NodeTransferTests(IsolatedAsyncioTestCase):
             "token": "new-token",
         }
 
-        with patch("mafic.player.NodePool.get_node", return_value=node):
+        with patch(
+            "mafic.player.pool_for",
+            return_value=Mock(get_node=Mock(return_value=node)),
+        ):
             await self.player.on_voice_server_update(data)
 
         self.assertIs(self.player._node, node)
@@ -983,7 +987,10 @@ class NodeTransferTests(IsolatedAsyncioTestCase):
         }
 
         with (
-            patch("mafic.player.NodePool.get_node", return_value=b_node),
+            patch(
+                "mafic.player.pool_for",
+                return_value=Mock(get_node=Mock(return_value=b_node)),
+            ),
             self.assertRaisesRegex(RuntimeError, "server migration failed"),
         ):
             await self.player.on_voice_server_update(server_data)
@@ -1017,7 +1024,10 @@ class NodeTransferTests(IsolatedAsyncioTestCase):
             "token": "new-token",
         }
 
-        with patch("mafic.player.NodePool.get_node", return_value=b_node):
+        with patch(
+            "mafic.player.pool_for",
+            return_value=Mock(get_node=Mock(return_value=b_node)),
+        ):
             server_task = asyncio.create_task(
                 self.player.on_voice_server_update(server_data)
             )

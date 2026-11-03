@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from yarl import URL
 
 from mafic.__libraries import Client, Guild, StageChannel, VoiceChannel, library
-from mafic.errors import PlayerNotConnected
+from mafic.errors import NoNodesAvailable, PlayerNotConnected
 from mafic.filter import Filter
 from mafic.ip import FailingAddress
 from mafic.node import Node
@@ -69,18 +69,14 @@ class PlayerStateTests(TestCase):
         with self.assertRaises(AttributeError):
             setattr(player, "assigned_node", node)  # noqa: B010
 
-    def test_node_fallback_does_not_assign_node(self) -> None:
-        """The existing node fallback leaves the player unassigned."""
+    def test_unassigned_player_cannot_borrow_a_node(self) -> None:
+        """An unassigned player has no pool scope and must not guess a node."""
         player = make_player()
         player._node = None
         player._guild_id = 1
-        node = make_node(4)
 
-        with patch.object(NodePool, "get_random_node", return_value=node) as fallback:
-            self.assertIs(player.node, node)
-            self.assertIsNone(player.assigned_node)
-
-        fallback.assert_called_once_with()
+        with self.assertRaises(NoNodesAvailable):
+            _ = player.node
 
     def test_set_state_reads_player_state_and_track_metadata(self) -> None:
         """Sync/resume reconstruction keeps state and complete track metadata."""
@@ -445,7 +441,10 @@ class VoiceStateTests(IsolatedAsyncioTestCase):
         self.player.node._players = {}
         with (
             patch.object(Node, "voice_update", side_effect=voice_update),
-            patch("mafic.player.NodePool.get_node", return_value=self.player.node),
+            patch(
+                "mafic.player.pool_for",
+                return_value=Mock(get_node=Mock(return_value=self.player.node)),
+            ),
         ):
             state = asyncio.create_task(self.voice_state_update(20))
             await first_entered.wait()

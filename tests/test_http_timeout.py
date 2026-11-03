@@ -75,11 +75,7 @@ class HttpTimeoutTests(IsolatedAsyncioTestCase):
     async def test_create_node_forwards_http_timeout(self) -> None:
         """NodePool.create_node passes the timeout to the constructed node."""
         timeout = aiohttp.ClientTimeout(total=15)
-        nodes: dict[str, Node[Client]] = {}
-        with (
-            patch.object(NodePool, "_nodes", nodes),
-            patch.object(Node, "connect", new=AsyncMock()),
-        ):
+        with patch.object(Node, "connect", new=AsyncMock()):
             pool = NodePool(cast("Client", Mock(spec=Client)))
             node = await pool.create_node(
                 host="localhost",
@@ -90,4 +86,4 @@ class HttpTimeoutTests(IsolatedAsyncioTestCase):
             )
 
         self.assertIs(node._http_timeout, timeout)
-        self.assertIs(nodes["forwarded"], node)
+        self.assertIs(pool.label_to_node["forwarded"], node)

@@ -31,7 +31,7 @@ from .errors import (
 )
 from .events import *
 from .filter import Filter
-from .pool import NodePool
+from .pool import NodePool, pool_for
 from .search_type import SearchType
 from .track import Track
 from .type_variables import ClientT
@@ -280,12 +280,17 @@ class Player(VoiceProtocol, Generic[ClientT]):
         """
         if self._node is None:
             _log.warning(
-                "Unable to use best node, player not connected, finding random node.",
+                "Player has no assigned node and cannot select one.",
                 extra={"guild": self._guild_id},
             )
-            return NodePool[ClientT].get_random_node()
+            raise NoNodesAvailable
 
         return self._node
+
+    @property
+    def _pool(self) -> NodePool[ClientT] | None:
+        """The node scope of this player's Discord client, if one exists."""
+        return cast("NodePool[ClientT] | None", pool_for(self.client))
 
     @property
     def assigned_node(self) -> Node[ClientT] | None:
@@ -608,7 +613,10 @@ class Player(VoiceProtocol, Generic[ClientT]):
                 _log.debug(
                     "Getting best node for player", extra={"guild": self._guild_id}
                 )
-                selected_node = NodePool[ClientT].get_node(
+                pool = self._pool
+                if pool is None:
+                    raise NoNodesAvailable
+                selected_node = pool.get_node(
                     guild_id=data["guild_id"], endpoint=data["endpoint"]
                 )
                 _log.debug(
@@ -663,9 +671,8 @@ class Player(VoiceProtocol, Generic[ClientT]):
             msg = "Voice channel must be a VoiceChannel or StageChannel."
             raise TypeError(msg)
 
-        # I really don't like how pyright rules are so incredibly long,
-        # This has 2 type issues.
-        if not NodePool.nodes:  # pyright: ignore   # noqa: PGH003
+        pool = self._pool
+        if pool is None or not pool.nodes:
             self.cleanup()
             raise NoNodesAvailable
 

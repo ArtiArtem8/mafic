@@ -209,13 +209,7 @@ class NodeLifecycleTests(IsolatedAsyncioTestCase):
     async def test_initial_failure_does_not_register_unready_node(self) -> None:
         """NodePool waits through failures and retains the requested player class."""
         self.accept_connections = False
-        nodes: dict[str, Node[Client]] = {}
-        with (
-            patch.object(NodePool, "_nodes", nodes),
-            patch.object(NodePool, "_client", None),
-            patch.object(NodePool, "_default_strategies", [], create=True),
-            patch.object(Node, "sync_players", new_callable=AsyncMock) as sync,
-        ):
+        with (patch.object(Node, "sync_players", new_callable=AsyncMock) as sync,):
             pool = NodePool(cast("Client", self.client))
             task = asyncio.create_task(pool.add_node(self.node, player_cls=Player))
             try:

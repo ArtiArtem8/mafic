@@ -9,16 +9,16 @@ from functools import partial
 from logging import getLogger
 from random import choice
 from typing import TYPE_CHECKING, Any, Generic, Sequence, TypeVar, Union, cast
+from weakref import WeakKeyDictionary, ref
 
-from .errors import NoNodesAvailable, PlayerNotConnected
+from .errors import NodePoolAlreadyBound, NoNodesAvailable, PlayerNotConnected
 from .node import Node
 from .strategy import Strategy, StrategyCallable, call_strategy
 from .type_variables import ClientT
-from .utils import classproperty
 from .utils.tasks import await_owned
 
 if TYPE_CHECKING:
-    from typing import ClassVar
+    from weakref import ReferenceType
 
     import aiohttp
 
@@ -30,6 +30,23 @@ T = TypeVar("T")
 __all__ = ("NodePool",)
 
 _log = getLogger(__name__)
+
+_pools: WeakKeyDictionary[object, ReferenceType[NodePool[Any]]] = WeakKeyDictionary()
+"""Active pool per Discord client.
+
+Both the key and the value are weak: the registry never keeps a client or a
+pool alive, and the pool holds no reference back to the registry.
+"""
+
+
+def pool_for(client: object) -> NodePool[Any] | None:
+    """Return the active pool bound to one Discord client, if any.
+
+    Discord constructs a player through ``cls(client, channel)``, so this is
+    how a player finds the node scope that owns its client.
+    """
+    entry = _pools.get(client)
+    return entry() if entry is not None else None
 
 
 StrategyList = Union[
@@ -61,23 +78,31 @@ class NodePool(Generic[ClientT]):
         [:attr:`Strategy.SHARD`, :attr:`Strategy.LOCATION`, :attr:`Strategy.USAGE`].
     """
 
-    __slots__ = ("_remove_tasks",)
-
-    # Generics as expected, do not work in class variables.
-    # Don't fear, the public methods using this are typed well.
-    _nodes: ClassVar[dict[str, Node[Any]]] = {}
-    _client: ClientT | None = None
+    __slots__ = (
+        "__weakref__",
+        "_client",
+        "_default_strategies",
+        "_nodes",
+        "_remove_tasks",
+    )
 
     def __init__(
         self,
         client: ClientT,
         default_strategies: StrategyList[ClientT] | None = None,
     ) -> None:
-        NodePool._client = client
+        existing = pool_for(client)
+        if existing is not None:
+            msg = f"Client {client!r} already has an active NodePool."
+            raise NodePoolAlreadyBound(msg)
+        self._client: ClientT = client
+        # Per pool: independent Discord clients must never share nodes.
+        self._nodes: dict[str, Node[ClientT]] = {}
         # Identity, not label: a replacement with the same label is a new node.
         self._remove_tasks: dict[Node[Any], asyncio.Task[None]] = {}
+        _pools[client] = ref(self)
 
-        NodePool._default_strategies = (
+        self._default_strategies: StrategyList[ClientT] = (
             [
                 Strategy.SHARD,
                 Strategy.LOCATION,
@@ -87,15 +112,15 @@ class NodePool(Generic[ClientT]):
             else default_strategies
         )
 
-    @classproperty
-    def label_to_node(cls) -> dict[str, Node[ClientT]]:
+    @property
+    def label_to_node(self) -> dict[str, Node[ClientT]]:
         """Get a mapping node labels to nodes."""
-        return cls._nodes
+        return self._nodes
 
-    @classproperty
-    def nodes(cls) -> list[Node[ClientT]]:
+    @property
+    def nodes(self) -> list[Node[ClientT]]:
         """Get the list of all available nodes."""
-        return list(filter(lambda n: n.available, cls._nodes.values()))
+        return list(filter(lambda n: n.available, self._nodes.values()))
 
     async def create_node(
         self,
@@ -180,10 +205,6 @@ class NodePool(Generic[ClientT]):
         RuntimeError
             If the node pool has not been initialized.
         """
-        if self._client is None:
-            msg = "NodePool has not been initialized."
-            raise RuntimeError(msg)
-
         node = Node(
             host=host,
             port=port,
@@ -226,6 +247,10 @@ class NodePool(Generic[ClientT]):
 
             .. versionadded:: 2.8
         """
+        owner = cast("ClientT | None", node.client)
+        if owner is not None and owner is not self._client:
+            msg = "Node belongs to a different client than this pool."
+            raise ValueError(msg)
         _log.info("Created node, connecting it...", extra={"label": node.label})
         await node.connect(player_cls=player_cls)
 
@@ -376,16 +401,22 @@ class NodePool(Generic[ClientT]):
                 )
 
     async def close(self) -> None:
-        """Close all nodes in the pool.
+        """Close all nodes in the pool and release its client scope.
+
+        A new pool may be created for the same client afterwards.
 
         .. versionadded:: 2.6
         """
-        for node in self._nodes.values():
-            await node.close()
+        try:
+            for node in self._nodes.values():
+                await node.close()
+        finally:
+            entry = _pools.get(self._client)
+            if entry is not None and entry() is self:
+                del _pools[self._client]
 
-    @classmethod
     def get_node(
-        cls,
+        self,
         *,
         guild_id: str | int,
         endpoint: str | None,
@@ -413,20 +444,13 @@ class NodePool(Generic[ClientT]):
         RuntimeError
             If the node pool has not been initialized.
         """
-        if cls._client is None:
-            msg = "NodePool has not been initialized."
-            raise RuntimeError(msg)
-
         actual_strategies: Sequence[StrategyCallable[ClientT] | Strategy]
 
-        strategies = strategies or cls._default_strategies
+        strategies = strategies or self._default_strategies
 
         actual_strategies = [strategies] if callable(strategies) else strategies
 
-        # It is a classproperty.
-        # fmt: off
-        nodes = cast("list[Node[ClientT]]", cls.nodes)  # pyright: ignore  # noqa: PGH003
-        # fmt: on
+        nodes = self.nodes
 
         for strategy in actual_strategies:
             if isinstance(strategy, Strategy):
@@ -435,7 +459,7 @@ class NodePool(Generic[ClientT]):
                 strategy_callable = strategy
 
             nodes = strategy_callable(
-                nodes, int(guild_id), cls._client.shard_count, endpoint
+                nodes, int(guild_id), self._client.shard_count, endpoint
             )
 
             _log.debug(
@@ -451,8 +475,7 @@ class NodePool(Generic[ClientT]):
 
         return choice(nodes)
 
-    @classmethod
-    def get_random_node(cls) -> Node[ClientT]:
+    def get_random_node(self) -> Node[ClientT]:
         """Get a random node.
 
         Returns
@@ -465,10 +488,7 @@ class NodePool(Generic[ClientT]):
         ValueError
             If there are no nodes.
         """
-        # It is a classproperty.
-        nodes = cast(
-            "list[Node[ClientT]]", cls.nodes  # pyright: ignore  # noqa: PGH003
-        )
+        nodes = self.nodes
 
         if node := choice(nodes):
             return node

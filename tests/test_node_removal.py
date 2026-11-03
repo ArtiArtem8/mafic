@@ -22,6 +22,7 @@ class FakeNode:
 
     def __init__(self, label: str) -> None:
         self.label = label
+        self.client: object | None = None
         self._players: dict[int, Player[Client]] = {}
         self.connect = AsyncMock()
         self.quiesce = AsyncMock()
@@ -61,11 +62,12 @@ class NodeRemovalTests(IsolatedAsyncioTestCase):
         client = Mock(spec=Client)
         client.is_closed.return_value = False
         self.client = cast("Client", client)
-        self.nodes: dict[str, Node[Client]] = {}
-        self.enterContext(patch.object(NodePool, "_nodes", self.nodes))
         self.pool = NodePool(self.client)
+        self.nodes: dict[str, Node[Client]] = self.pool._nodes
         self.node = FakeNode("A")
         self.target = FakeNode("B")
+        self.node.client = self.client
+        self.target.client = self.client
         self.nodes["A"] = cast("Node[Client]", self.node)
         self.nodes["B"] = cast("Node[Client]", self.target)
 

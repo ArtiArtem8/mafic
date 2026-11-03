@@ -22,6 +22,7 @@ __all__ = (
     "NoCompatibleLibraries",
     "NoNodesAvailable",
     "NodeAlreadyConnected",
+    "NodePoolAlreadyBound",
     "NodeQuiesced",
     "PlayerException",
     "PlayerNotConnected",
@@ -123,6 +124,14 @@ class PlayerNotConnected(PlayerException):
 
     def __init__(self) -> None:
         super().__init__("The player is not connected to a voice channel.")
+
+
+class NodePoolAlreadyBound(MaficException):
+    """A Discord client already has an active :class:`NodePool`.
+
+    Close the existing pool before creating another one for the same
+    client; a silent replacement would strand its nodes and players.
+    """
 
 
 class NodeQuiesced(MaficException):

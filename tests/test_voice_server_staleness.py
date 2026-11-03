@@ -7,9 +7,7 @@ from __future__ import annotations
 import asyncio
 from asyncio import Event
 from typing import TYPE_CHECKING, cast
-from unittest.mock import patch
-
-from mafic.pool import NodePool
+from unittest.mock import Mock, patch
 
 from .test_player_update import player_payload
 from .test_voice_ownership_poc import GUILD_ID, FakeNode, VoiceTestCase
@@ -89,7 +87,12 @@ class VoiceServerStalenessTests(VoiceTestCase):
 
         self.node.fetch_player.side_effect = fetch
 
-        with patch.object(NodePool, "get_node", return_value=self.target):
+        pool = Mock(nodes=[self.target], get_node=Mock(return_value=self.target))
+
+        def resolve(_client: object) -> Mock:
+            return pool
+
+        with patch("mafic.player.pool_for", resolve):
             callback = asyncio.create_task(
                 player.on_voice_server_update(self.server_update("other.example.com"))
             )

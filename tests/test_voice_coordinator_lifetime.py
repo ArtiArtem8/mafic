@@ -13,7 +13,6 @@ from unittest.mock import Mock, patch
 
 from mafic.__libraries import Client, VoiceChannel
 from mafic.player import Player
-from mafic.pool import NodePool
 
 from .test_voice_ownership_poc import (
     CHANNEL_ID,
@@ -33,7 +32,15 @@ class CoordinatorLifetimeTests(IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         """Install a pool registry so Player.connect can resolve a node."""
         self.node = FakeNode()
-        self.enterContext(patch.object(NodePool, "nodes", [self.node]))
+        pool = Mock(nodes=[self.node], get_node=Mock(return_value=self.node))
+
+        # A Mock would record pool_for(client) and keep the client alive;
+        # this test checks that a closed client is collectable.
+        def resolve(_client: object) -> Mock:
+            """Return the stub pool without recording the client argument."""
+            return pool
+
+        self.enterContext(patch("mafic.player.pool_for", resolve))
 
     def make_player(self, client: FakeClient, guild: FakeGuild) -> Player[Client]:
         """Build a real Player bound to the fake guild and client."""

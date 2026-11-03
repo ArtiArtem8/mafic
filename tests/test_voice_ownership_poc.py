@@ -17,7 +17,6 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from mafic.__libraries import Client, VoiceChannel, VoiceProtocol
 from mafic.player import Player
-from mafic.pool import NodePool
 
 from .test_player_update import player_payload
 
@@ -192,7 +191,10 @@ class VoiceTestCase(IsolatedAsyncioTestCase):
         self.client = FakeClient()
         self.guild = FakeGuild(self.client)
         self.node = FakeNode()
-        self.enterContext(patch.object(NodePool, "nodes", [self.node]))
+        # Player lifecycle tests stub the client scope; pool selection has
+        # its own coverage in test_pool_scope.
+        pool = Mock(nodes=[self.node], get_node=Mock(return_value=self.node))
+        self.enterContext(patch("mafic.player.pool_for", return_value=pool))
 
     def make_player(self) -> Player[Client]:
         """Build a real Player whose guild is the fake cache owner."""

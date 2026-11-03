@@ -7,6 +7,23 @@ into one entry, with links to the original changes.
 
 ## November 3, 2026
 
+- Added `Node.quiesce()` for a planned stop of the node transport that keeps
+  the HTTP API usable for transfers and deletes; a quiesced node refuses
+  `connect()` with `NodeQuiesced` until `close()` resets it
+- `NodePool.remove_node()` now quiesces the node before snapshotting players,
+  so removal owns the whole teardown and no reconnect can register a player
+  into a node that is already leaving the pool
+- `NodePool.nodes` and `NodePool.get_node()` are instance members: node state,
+  strategies and the client binding no longer leak between pools
+  - **Breaking:** class-level access such as `NodePool.nodes` no longer works;
+    keep a pool instance and use it instead
+  - Each Discord client has one active pool; `NodePoolAlreadyBound` is raised
+    instead of silently replacing it, and `close()` releases the client
+  - `pool_for(client)` resolves the active pool of one client
+  - `NodePool.add_node()` rejects a node that belongs to another client
+- A player without an assigned node no longer borrows a node from another
+  client: `Player.node` raises `NoNodesAvailable` instead of selecting a
+  global fallback
 - Ordered internal voice operations per client and guild across player generations
 - Kept failed or cancelled remote mutations as unresolved when their outcome is
   unknown; a late request may still take effect
