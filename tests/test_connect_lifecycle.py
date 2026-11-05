@@ -67,6 +67,27 @@ class ConnectLifecycleTests(VoiceTestCase):
         self.assertIsNone(player._coordinator.owner)
         self.assert_no_pending_tasks()
 
+    async def test_join_and_readiness_share_one_timeout(self) -> None:
+        """A slow JOIN does not start a fresh readiness deadline."""
+        player = self.make_player()
+        self.register(player)
+        self.guild.block_join = True
+        connect = asyncio.create_task(player.connect(timeout=1, reconnect=True))
+        try:
+            await asyncio.wait_for(self.guild.join_started.wait(), 2)
+            await asyncio.sleep(0.6)
+            self.guild.release_join.set()
+
+            # A second one-second timeout would still be waiting at this point.
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(connect), 0.65)
+            self.assertTrue(connect.done(), "the overall connection timeout expired")
+            self.assertIsNone(self.guild.voice_client)
+        finally:
+            self.guild.release_join.set()
+            connect.cancel()
+            await asyncio.gather(connect, return_exceptions=True)
+
     async def test_failed_connect_never_touches_a_newer_owner(self) -> None:
         """A superseded connect must not leave voice for its replacement."""
         player = self.make_player()

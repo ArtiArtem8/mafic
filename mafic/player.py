@@ -12,7 +12,7 @@ from copy import copy as shallow_copy
 from functools import reduce
 from logging import getLogger
 from time import monotonic
-from typing import TYPE_CHECKING, Generic, cast
+from typing import TYPE_CHECKING, Generic, TypeVar, cast
 from uuid import uuid4
 
 from .__libraries import (
@@ -28,6 +28,7 @@ from .errors import (
     HTTPNotFound,
     NoNodesAvailable,
     PlayerNotConnected,
+    RequestNotSent,
 )
 from .events import *
 from .filter import Filter
@@ -39,7 +40,7 @@ from .typings import TrackWithInfo
 from .utils.tasks import await_owned
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Awaitable, Mapping
 
     from .__libraries import (
         Connectable,
@@ -59,6 +60,7 @@ if TYPE_CHECKING:
 
 _log = getLogger(__name__)
 __all__ = ("Player",)
+_ResultT = TypeVar("_ResultT")
 
 
 _REJECTED_STATUSES = frozenset({400, 401, 403, 404, 405, 422})
@@ -84,11 +86,13 @@ def _consume_teardown_result(task: asyncio.Task[None]) -> None:
 def _is_unknown_outcome(error: BaseException) -> bool:
     """Whether a failed remote effect may still have been applied.
 
-    Only a refusal proves the effect did not happen. Everything else is
-    undecided: 408 and 5xx may have run downstream, and a timeout, dropped
-    transport or cancellation has no response at all, so the request may still
-    reach Lavalink later.
+    A local rejection or server refusal proves the effect did not happen.
+    Everything else is undecided: 408 and 5xx may have run downstream, and a
+    timeout, dropped transport or cancellation has no response at all, so the
+    request may still reach Lavalink later.
     """
+    if isinstance(error, RequestNotSent):
+        return False
     if isinstance(error, HTTPException):
         return error.status not in _REJECTED_STATUSES
     return True
@@ -272,11 +276,10 @@ class Player(VoiceProtocol, Generic[ClientT]):
 
     @property
     def node(self) -> Node[ClientT]:
-        """The assigned node, or a usable node from the pool.
+        """The assigned node.
 
-        If no node is assigned, this selects a random available node without
-        assigning it to the player. Use :attr:`assigned_node` to inspect the
-        current assignment without selecting a fallback.
+        Raises :exc:`NoNodesAvailable` when no node is assigned. Use
+        :attr:`assigned_node` to inspect the assignment without raising.
         """
         if self._node is None:
             _log.warning(
@@ -296,8 +299,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
     def assigned_node(self) -> Node[ClientT] | None:
         """The node explicitly assigned to this player, if any.
 
-        Unlike :attr:`node`, this only reports the current assignment. It returns
-        ``None`` when unassigned and never selects or assigns a fallback node.
+        Unlike :attr:`node`, this returns ``None`` when no node is assigned.
         """
         return self._node
 
@@ -381,16 +383,14 @@ class Player(VoiceProtocol, Generic[ClientT]):
             _log.debug("Received player update before channel was set.")
             return
 
-        try:
-            await node.voice_update(
+        await self._await_remote_effect(
+            node.voice_update(
                 guild_id=self._guild_id,
                 session_id=session_id,
                 data=server_state,
                 channel_id=int(channel.id),
             )
-        except BaseException as error:
-            self._note_remote_failure(error)
-            raise
+        )
 
     def dispatch_event(self, data: EventPayload) -> None:
         """Dispatch an event to the player.
@@ -659,7 +659,8 @@ class Player(VoiceProtocol, Generic[ClientT]):
         Parameters
         ----------
         timeout:
-            The timeout for the connection.
+            The timeout for the join request and readiness together. Cleanup
+            after a failure can take additional time.
         reconnect:
             Whether to reconnect to the voice channel if the connection is lost.
         self_mute:
@@ -692,32 +693,26 @@ class Player(VoiceProtocol, Generic[ClientT]):
                 "from a previous generation may remove this player.",
                 extra={"guild": self._guild_id},
             )
-        failure: BaseException | None = None
         try:
             async with asyncio.timeout(timeout):
                 async with self._coordinator.hold():
-                    if self._coordinator.is_current(self, self._ownership_epoch):
-                        self._join_sent = True
-                        await self.channel.guild.change_voice_state(
-                            channel=self.channel,
-                            self_mute=self_mute,
-                            self_deaf=self_deaf,
-                        )
-                    else:
-                        failure = PlayerNotConnected()
+                    if not self._coordinator.is_current(self, self._ownership_epoch):
+                        raise PlayerNotConnected  # noqa: TRY301 - compensated below
+                    self._join_sent = True
+                    await self.channel.guild.change_voice_state(
+                        channel=self.channel,
+                        self_mute=self_mute,
+                        self_deaf=self_deaf,
+                    )
 
-            if failure is None and not await self._wait_for_voice_events(timeout):
-                failure = asyncio.TimeoutError()
+                if not await self._wait_for_voice_events(timeout):
+                    raise asyncio.TimeoutError  # noqa: TRY301 - compensated below
+                # Readiness can finish after another generation claimed the guild.
+                if self._superseded():
+                    raise PlayerNotConnected  # noqa: TRY301 - compensated below
         except BaseException as error:
             await self._compensate_failed_connect(error)
             raise
-
-        # Readiness can finish after another generation claimed the guild.
-        if failure is None and self._superseded():
-            failure = PlayerNotConnected()
-        if failure is not None:
-            await self._compensate_failed_connect(failure)
-            raise failure
 
     async def _wait_for_voice_events(self, timeout: float) -> bool:
         """Wait for Discord and Lavalink readiness, retiring every waiter."""
@@ -989,8 +984,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
                         extra={"guild": self.guild.id, "node": node.label},
                     )
                 except asyncio.CancelledError as error:
-                    # The DELETE was already sent; cancelling the await does
-                    # not cancel the request.
+                    # The server may have received DELETE before cancellation.
                     self._note_remote_failure(error)
                     raise
                 except Exception as error:  # noqa: BLE001 - leave must continue
@@ -1003,7 +997,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
 
             voice_client = self.guild.voice_client
             if voice_client is not self and voice_client is not None:
-                self._cleanup_local_state()
+                self.cleanup()
                 return
 
             # The destroy above had an await point; a newer generation may have
@@ -1042,6 +1036,14 @@ class Player(VoiceProtocol, Generic[ClientT]):
             extra={"guild": self._guild_id},
         )
         _log.debug("Remote effect failure traceback", exc_info=error)
+
+    async def _await_remote_effect(self, request: Awaitable[_ResultT]) -> _ResultT:
+        """Record failures of a prepared remote request before propagating them."""
+        try:
+            return await request
+        except BaseException as error:
+            self._note_remote_failure(error)
+            raise
 
     def _take_ownership(self) -> None:
         """Claim a new ownership generation for this instance."""
@@ -1170,23 +1172,25 @@ class Player(VoiceProtocol, Generic[ClientT]):
         snapshot_filter = Filter.from_payload(snapshot["filters"])
         labels_match_snapshot = self._merged_filter().payload == snapshot["filters"]
 
+        voice_request = node.voice_update(
+            guild_id=self._guild_id,
+            session_id=session_id,
+            data=server_state,
+            channel_id=int(channel.id),
+        )
         try:
-            await node.voice_update(
-                guild_id=self._guild_id,
-                session_id=session_id,
-                data=server_state,
-                channel_id=int(channel.id),
+            await self._await_remote_effect(voice_request)
+            target_state = await self._await_remote_effect(
+                node.update(
+                    guild_id=self._guild_id,
+                    track=prepared_track,
+                    position=snapshot["state"]["position"],
+                    volume=snapshot["volume"],
+                    pause=snapshot["paused"],
+                    filter=snapshot_filter,
+                )
             )
-            target_state = await node.update(
-                guild_id=self._guild_id,
-                track=prepared_track,
-                position=snapshot["state"]["position"],
-                volume=snapshot["volume"],
-                pause=snapshot["paused"],
-                filter=snapshot_filter,
-            )
-        except (Exception, asyncio.CancelledError) as error:
-            self._note_remote_failure(error)
+        except (Exception, asyncio.CancelledError):
             await self._destroy_partial_target(node)
             raise
 
@@ -1214,17 +1218,24 @@ class Player(VoiceProtocol, Generic[ClientT]):
         if not labels_match_snapshot:
             self._filters = OrderedDict({"RESUME": snapshot_filter})
 
-        # The migration is committed; old cleanup is best-effort.
+        # Record failures inside the owned task even if this caller is cancelled.
+        await await_owned(
+            asyncio.create_task(self._cleanup_old_node(old_node)),
+            extra={"guild": self.guild.id, "node": old_node.label},
+        )
+
+    async def _cleanup_old_node(self, node: Node[ClientT]) -> None:
+        """Best-effort cleanup after the target has become authoritative."""
         try:
-            await await_owned(
-                asyncio.create_task(old_node.destroy(guild_id=self.guild.id)),
-                extra={"guild": self.guild.id, "node": old_node.label},
-            )
+            await node.destroy(guild_id=self.guild.id)
+        except asyncio.CancelledError as error:
+            self._note_remote_failure(error)
+            raise
         except Exception as error:  # noqa: BLE001 - committed migration
             self._note_remote_failure(error)
             _log.exception(
                 "Failed to destroy old node player after transfer.",
-                extra={"guild": self.guild.id, "node": old_node.label},
+                extra={"guild": self.guild.id, "node": node.label},
             )
 
     async def _destroy_partial_target(self, node: Node[ClientT]) -> None:
@@ -1232,8 +1243,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
         try:
             await node.destroy(guild_id=self.guild.id)
         except asyncio.CancelledError as error:
-            # The DELETE was already sent; cancelling the await does not
-            # cancel the request, so the outcome is unknown, not absent.
+            # The server may have received DELETE before cancellation.
             self._note_remote_failure(error)
             raise
         except Exception as error:  # noqa: BLE001 - preserve the original error
@@ -1299,20 +1309,38 @@ class Player(VoiceProtocol, Generic[ClientT]):
         None
             If the load type is ``NO_MATCHES``.
 
-        Notes
-        -----
-        If a node was not selected due to not being connected, this will use a
-        random node.
+        Raises
+        ------
+        NoNodesAvailable
+            If no node is assigned to the player.
         """
         node = self.node
-
-        raw_type: str
-        if isinstance(search_type, SearchType):
-            raw_type = search_type.value
-        else:
-            raw_type = search_type
-
+        raw_type = (
+            search_type.value if isinstance(search_type, SearchType) else search_type
+        )
         return await node.fetch_tracks(query, search_type=raw_type)
+
+    @staticmethod
+    def _validate_track_update(
+        node: Node[ClientT],
+        track: Track | str | None,
+        user_data: Mapping[str, JSONValue],
+    ) -> None:
+        """Reject track options that cannot be represented on the node."""
+        if node.version != 3:
+            return
+        if user_data is not MISSING:
+            message = "Lavalink version 3 does not support track user data."
+            raise TypeError(message)
+        if isinstance(track, Track) and track.user_data:
+            message = "Lavalink version 3 cannot preserve Track.user_data."
+            raise TypeError(message)
+        if isinstance(track, str):
+            message = (
+                "Lavalink version 3 does not support identifiers "
+                "due to unexpected behaviour with events."
+            )
+            raise TypeError(message)
 
     async def update(
         self,
@@ -1361,40 +1389,19 @@ class Player(VoiceProtocol, Generic[ClientT]):
         PlayerNotConnected
             If the player is not connected to a voice channel.
         """
-        if self._node is None or not self._connected:
+        node = self._node
+        if node is None or not self._connected:
             raise PlayerNotConnected
 
-        if self.node.version == 3:
-            if user_data is not MISSING:
-                message = "Lavalink version 3 does not support track user data."
-                raise TypeError(message)
-
-            if isinstance(track, Track) and track.user_data:
-                message = "Lavalink version 3 cannot preserve Track.user_data."
-                raise TypeError(message)
-
-        # v4+ receives the full payload in events, so there is no need to
-        # pre-emptyively update the player.
-        if track is not MISSING and track is not None and self.node.version == 3:
-            if isinstance(track, str):
-                message = (
-                    "Lavalink version 3 does not support identifiers "
-                    "due to unexpected behaviour with events."
-                )
-                raise TypeError(message)
-
-            self._current = track
-
-        node = self._node
-        if node.version != 3 and track is not MISSING and track is not None:
+        self._validate_track_update(node, track, user_data)
+        metadata: dict[str, JSONValue] | None = None
+        if track is not MISSING and track is not None:
             if user_data is not MISSING:
                 metadata = dict(user_data)
             elif isinstance(track, Track):
                 metadata = dict(track.user_data)
             else:
                 metadata = {}
-            metadata[_PLAYBACK_ID_KEY] = str(uuid4())
-            user_data = metadata
 
         self._playback_generation += 1
         generation = self._playback_generation
@@ -1410,8 +1417,25 @@ class Player(VoiceProtocol, Generic[ClientT]):
                 # lane; a PATCH after that DELETE would resurrect the player.
                 if self._disconnect_requested or self._superseded():
                     raise PlayerNotConnected
-                try:
-                    data = await node.update(
+                current_node = self._node
+                if current_node is None or not self._connected:
+                    raise PlayerNotConnected
+                if current_node is not node:
+                    # A transfer committed while this update waited for the lane.
+                    node = current_node
+                    self._validate_track_update(node, track, user_data)
+                    generation = self._playback_generation
+                    state_updates = self._state_updates
+
+                if node.version == 3 and isinstance(track, Track):
+                    # V3 events do not carry the track's full metadata.
+                    self._current = track
+                elif node.version != 3 and metadata is not None:
+                    metadata[_PLAYBACK_ID_KEY] = str(uuid4())
+                    user_data = metadata
+
+                data = await self._await_remote_effect(
+                    node.update(
                         guild_id=self._guild_id,
                         track=track,
                         position=position,
@@ -1422,9 +1446,7 @@ class Player(VoiceProtocol, Generic[ClientT]):
                         no_replace=not replace,
                         user_data=user_data,
                     )
-                except BaseException as error:
-                    self._note_remote_failure(error)
-                    raise
+                )
             if (
                 self._node is not node
                 or self._disconnect_requested

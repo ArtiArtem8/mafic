@@ -28,6 +28,7 @@ import yarl
 from .__libraries import MISSING, ExponentialBackoff, dumps, loads
 from ._voice_ownership import coordinator_for
 from .errors import *
+from .errors import RequestNotSent
 from .ip import (
     BalancingIPRoutePlannerStatus,
     NanoIPRoutePlannerStatus,
@@ -846,16 +847,23 @@ class Node(Generic[ClientT]):
             # _disconnect. Its cleanup must stop before we take over socket closure.
             await gather(*tasks, return_exceptions=True)
             ws = self._ws
-            if ws is not None:
-                self._ws = None
-                try:
-                    await ws.close()
-                except Exception:  # noqa: BLE001 - transport is already stopping
-                    _log.debug(
-                        "Failed to close node websocket.",
-                        exc_info=True,
+            if ws is None:
+                return
+            self._ws = None
+            try:
+                await ws.close()
+                if not ws.closed:
+                    msg = "Node websocket did not close."
+                    raise RuntimeError(msg)  # noqa: TRY301 - handled below
+            except BaseException as error:
+                self._ws = ws
+                if isinstance(error, Exception):
+                    _log.error(
+                        "Failed to close node websocket; node remains unavailable.",
+                        exc_info=error,
                         extra={"label": self._label},
                     )
+                raise
 
     async def quiesce(self) -> None:
         """Stop transport work while keeping the REST API usable.
@@ -867,11 +875,15 @@ class Node(Generic[ClientT]):
         caller cancellation is propagated only after it settles.
 
         Quiesce never aborts the HTTP session: a reconnect that is stuck in
-        REST delays it. Bound the wait at the caller and use :meth:`close` to
-        abort an internally owned session when transport must stop at once.
+        REST delays it. To bound the caller's wait, start quiesce as a task and
+        shield that task inside the timeout. A direct ``wait_for(quiesce(), ...)``
+        still waits for cancellation-safe shutdown after its deadline. Use
+        :meth:`close` to abort an internally owned session and unblock its
+        requests. A caller-owned session or cancellation-resistant task can
+        still delay shutdown.
 
         A quiesced node refuses :meth:`connect` with :class:`NodeQuiesced`
-        until :meth:`close` resets it.
+        until :meth:`close` succeeds.
 
         .. versionadded:: 2.12
         """
@@ -901,22 +913,15 @@ class Node(Generic[ClientT]):
 
     async def _abort_http(self) -> None:
         """Close an internally owned session so requests cannot hang shutdown."""
-        if not self._owns_session:
-            return
         session = self.__session
-        if session is None:
+        if not self._owns_session or session is None:
             return
-        self.__session = None
-        if session.closed:
-            return
-        try:
+        if not session.closed:
             await session.close()
-        except Exception:  # noqa: BLE001 - shutdown must continue
-            _log.debug(
-                "Failed to close node HTTP session.",
-                exc_info=True,
-                extra={"label": self._label},
-            )
+            if not session.closed:
+                msg = "Node HTTP session did not close."
+                raise RuntimeError(msg)
+        self.__session = None
 
     async def close(self) -> None:
         """Close the node and finish its owned teardown.
@@ -925,8 +930,10 @@ class Node(Generic[ClientT]):
         propagated only after that operation settles. An internally created
         HTTP session is closed; a caller-supplied session is left open, so an
         already-running request on that session may delay this call.
-        The node may be connected again with :meth:`connect` or
-        :meth:`NodePool.add_node` after this call completes.
+        If an owned session or websocket fails to close, the error is propagated
+        and the node remains quiesced until a later close succeeds.
+        After a successful close, the node may be connected again with
+        :meth:`connect` or :meth:`NodePool.add_node`.
 
         .. versionadded:: 2.6
         """
@@ -940,6 +947,7 @@ class Node(Generic[ClientT]):
 
     async def _close(self) -> None:
         """Perform terminal teardown exactly once for current callers."""
+        completed = False
         try:
             self._mark_unavailable()
 
@@ -948,31 +956,55 @@ class Node(Generic[ClientT]):
                 reconnect.cancel()
 
             # Abort REST before joining a reconnect that may be waiting on it.
-            await self._abort_http()
+            failure: Exception | None = None
+            try:
+                await self._abort_http()
+            except Exception as error:  # noqa: BLE001 - finish other cleanup first
+                failure = error
+                _log.error(
+                    "Failed to close node HTTP session; node remains unavailable.",
+                    exc_info=error,
+                    extra={"label": self._label},
+                )
             if reconnect is not None:
                 await gather(reconnect, return_exceptions=True)
             # Break a listener teardown that may be waiting on a task which
             # suppresses cancellation, then take over the final transport close.
             self._cancel_transport_tasks()
-            await self._disconnect()
+            try:
+                await self._disconnect()
+            except Exception as error:  # noqa: BLE001 - preserve both failures
+                if failure is None:
+                    failure = error
+                else:
+                    _log.error(
+                        "Failed to close node websocket after an HTTP failure.",
+                        exc_info=error,
+                        extra={"label": self._label},
+                    )
+            if failure is not None:
+                raise failure
+            completed = True
         finally:
             self.cleanup()
             self._closing = False
             self._close_task = None
-            self._quiesced = False
-            _log.info(
-                "Node %s is now closed.",
-                self._label,
-                extra={"label": self._label},
-            )
+            self._quiesced = not completed
+            if completed:
+                _log.info(
+                    "Node %s is now closed.",
+                    self._label,
+                    extra={"label": self._label},
+                )
 
     def cleanup(self) -> None:
-        """Cleanup the node, as if it were never connected."""
+        """Clear local state while retaining any still-open owned resources."""
         self._mark_unavailable()
-        self._ws = None
+        if self._ws is not None and self._ws.closed:
+            self._ws = None
         self._ws_task = None
         self._connect_task = None
-        if self._owns_session:
+        if self._owns_session and self.__session is not None and self.__session.closed:
             self.__session = None
 
     async def _ws_listener(
@@ -1400,14 +1432,14 @@ class Node(Generic[ClientT]):
         """
         if self._closing:
             msg = "Node is closing."
-            raise RuntimeError(msg)
+            raise RequestNotSent(msg)
         if self.__session is None:
             self.__session = await self._create_session()
 
         session = self.__session
         if session.closed:
             msg = "Node HTTP session is closed."
-            raise RuntimeError(msg)
+            raise RequestNotSent(msg)
         uri = self._rest_uri / path
 
         _log.debug(
@@ -1657,7 +1689,18 @@ class Node(Generic[ClientT]):
                 )
                 return
 
-        voice_state = guild.me.voice
+        member = guild.me
+        # discord.py can return None for a REST-only guild despite its annotation.
+        if member is None:  # pyright: ignore[reportUnnecessaryComparison]
+            _log.warning(
+                "Skipping restored player for guild %d: "
+                "bot voice state is unavailable.",
+                player_id,
+                extra={"label": self._label},
+            )
+            return
+
+        voice_state = member.voice
 
         if voice_state is None:
             return

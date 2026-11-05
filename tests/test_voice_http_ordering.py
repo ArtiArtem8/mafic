@@ -40,17 +40,40 @@ class Fixture:
         self.hold_delete = False
         self.delete_status = 204
         self.payload: PlayerPayload = player_payload()
+        self.requests: list[tuple[str, str]] = []
+        self.transfer_started = asyncio.Event()
+        self.release_transfer = asyncio.Event()
+        self.hold_transfer = False
 
-    async def patch_player(self, _request: web.Request) -> web.Response:
-        """Record a PATCH and note whether it overlapped a running DELETE."""
-        self.order.append("PATCH")
-        self.patch_started.set()
-        if self.delete_started.is_set() and not self.delete_completed.is_set():
-            self.patch_overlapped_delete = True
+    async def get_player(self, request: web.Request) -> web.Response:
+        """Return a player snapshot for a transfer."""
+        self.requests.append((request.match_info["session"], "GET"))
         return web.json_response(dict(self.payload))
 
-    async def delete_player(self, _request: web.Request) -> web.Response:
+    async def patch_player(self, request: web.Request) -> web.Response:
+        """Record a PATCH and note whether it overlapped a running DELETE."""
+        session = request.match_info["session"]
+        data = cast("dict[str, object]", await request.json())
+        self.requests.append((session, "PATCH"))
+        self.order.append("PATCH")
+        self.patch_started.set()
+        if (
+            self.hold_transfer
+            and session == "target"
+            and not self.transfer_started.is_set()
+        ):
+            self.transfer_started.set()
+            await self.release_transfer.wait()
+        if self.delete_started.is_set() and not self.delete_completed.is_set():
+            self.patch_overlapped_delete = True
+        response = dict(self.payload)
+        if self.hold_transfer and session == "target" and "volume" in data:
+            response["volume"] = data["volume"]
+        return web.json_response(response)
+
+    async def delete_player(self, request: web.Request) -> web.Response:
         """Record a DELETE, optionally holding it open for the test."""
+        self.requests.append((request.match_info["session"], "DELETE"))
         self.order.append("DELETE")
         self.delete_started.set()
         if self.hold_delete:
@@ -66,6 +89,9 @@ class HttpOrderingTests(IsolatedAsyncioTestCase):
         """Start a disposable REST server and a node pointed at it."""
         self.fixture = Fixture()
         app = web.Application()
+        app.router.add_get(
+            "/v4/sessions/{session}/players/{guild_id}", self.fixture.get_player
+        )
         app.router.add_patch(
             "/v4/sessions/{session}/players/{guild_id}", self.fixture.patch_player
         )
@@ -94,6 +120,7 @@ class HttpOrderingTests(IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         """Release any held request, then close node and server."""
         self.fixture.release_delete.set()
+        self.fixture.release_transfer.set()
         await self.node.close()
         await self.server.close()
 
@@ -117,6 +144,57 @@ class HttpOrderingTests(IsolatedAsyncioTestCase):
         await player.disconnect(force=True)
 
         self.assertEqual(self.fixture.order, ["PATCH", "DELETE"])
+
+    async def test_update_waiting_for_transfer_uses_the_new_node(self) -> None:
+        """A queued PATCH must not recreate the player on the old session."""
+        player = self.make_player()
+        player._session_id = "discord-session"
+        player._server_state = {
+            "guild_id": GUILD_ID,
+            "endpoint": "voice.example.com",
+            "token": "token",
+        }
+        target: Node[Client] = Node(
+            host=self.server.host,
+            port=cast("int", self.server.make_url("/").port),
+            label="target",
+            password="secret",  # noqa: S106
+            client=cast("Client", self.client),
+        )
+        target._session_id = "target"
+        target._rest_uri /= "v4"
+        target._version = 4
+        self.fixture.hold_transfer = True
+        transfer = asyncio.create_task(player.transfer_to(target))
+        updates: list[asyncio.Task[None]] = []
+        try:
+            await asyncio.wait_for(self.fixture.transfer_started.wait(), 2)
+            for volume in (25, 40):
+                update = asyncio.create_task(player.update(volume=volume))
+                updates.append(update)
+                await asyncio.sleep(0)
+                self.assertFalse(update.done())
+            self.fixture.release_transfer.set()
+            await asyncio.wait_for(transfer, 2)
+            await asyncio.wait_for(asyncio.gather(*updates), 2)
+
+            self.assertEqual(
+                self.fixture.requests,
+                [
+                    (SESSION, "GET"),
+                    ("target", "PATCH"),
+                    ("target", "PATCH"),
+                    (SESSION, "DELETE"),
+                    ("target", "PATCH"),
+                    ("target", "PATCH"),
+                ],
+            )
+            self.assertIs(player.assigned_node, target)
+            self.assertEqual(player._volume, 40)
+        finally:
+            self.fixture.release_transfer.set()
+            await asyncio.gather(transfer, *updates, return_exceptions=True)
+            await target.close()
 
     async def test_patch_never_reaches_the_server_while_delete_runs(self) -> None:
         """The replacement PATCH must not overlap a DELETE on the same slot.

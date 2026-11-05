@@ -20,9 +20,9 @@ if TYPE_CHECKING:
 class FakeNode:
     """Minimal node state used by pool removal tests."""
 
-    def __init__(self, label: str) -> None:
+    def __init__(self, label: str, client: Client) -> None:
         self.label = label
-        self.client: object | None = None
+        self.client = client
         self._players: dict[int, Player[Client]] = {}
         self.connect = AsyncMock()
         self.quiesce = AsyncMock()
@@ -64,10 +64,8 @@ class NodeRemovalTests(IsolatedAsyncioTestCase):
         self.client = cast("Client", client)
         self.pool = NodePool(self.client)
         self.nodes: dict[str, Node[Client]] = self.pool._nodes
-        self.node = FakeNode("A")
-        self.target = FakeNode("B")
-        self.node.client = self.client
-        self.target.client = self.client
+        self.node = FakeNode("A", self.client)
+        self.target = FakeNode("B", self.client)
         self.nodes["A"] = cast("Node[Client]", self.node)
         self.nodes["B"] = cast("Node[Client]", self.target)
 
@@ -326,8 +324,8 @@ class NodeRemovalTests(IsolatedAsyncioTestCase):
 
     async def test_late_old_removal_does_not_remove_replacement(self) -> None:
         """A delayed removal must pop only the node instance it owns."""
-        old = FakeNode("A")
-        replacement = FakeNode("A")
+        old = FakeNode("A", self.client)
+        replacement = FakeNode("A", self.client)
         self.nodes["A"] = cast("Node[Client]", old)
 
         removal = asyncio.create_task(
@@ -365,7 +363,7 @@ class NodeRemovalTests(IsolatedAsyncioTestCase):
         )
         await asyncio.wait_for(started.wait(), 2)
 
-        replacement = FakeNode("A")
+        replacement = FakeNode("A", self.client)
         await self.pool.add_node(cast("Node[Client]", replacement))
         replacement_removal = asyncio.create_task(
             self.pool.remove_node(
@@ -416,7 +414,7 @@ class NodeRemovalTests(IsolatedAsyncioTestCase):
     async def test_transfer_skips_player_that_left_source(self) -> None:
         """Removal must not transfer a player that already changed ownership."""
         player = self.make_player(1, self.node)
-        other = FakeNode("C")
+        other = FakeNode("C", self.client)
         player._node = cast("Node[Client]", other)
         player.transfer_to = AsyncMock()
         player.disconnect = AsyncMock()
@@ -440,7 +438,7 @@ class NodeRemovalTests(IsolatedAsyncioTestCase):
         """Expected-source checking happens under the player ownership lock."""
         player = self.make_player(1, self.node)
         source = player.assigned_node
-        other = FakeNode("C")
+        other = FakeNode("C", self.client)
 
         await player._voice_update_lock.acquire()
         transfer = asyncio.create_task(
@@ -461,7 +459,7 @@ class NodeRemovalTests(IsolatedAsyncioTestCase):
     ) -> None:
         """A started teardown on a different node is not this removal's work."""
         player = self.make_player(1, self.node)
-        other = FakeNode("C")
+        other = FakeNode("C", self.client)
         player._node = cast("Node[Client]", other)
         release = asyncio.Event()
 

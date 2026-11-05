@@ -161,10 +161,8 @@ _coordinators: WeakKeyDictionary[object, dict[int, GuildVoiceCoordinator]] = (
 def coordinator_for(client: object, guild_id: int) -> GuildVoiceCoordinator:
     """Return the coordinator for one guild on one client.
 
-    The scope is the client, not the NodePool. Discord keys its voice-client
-    cache by guild id per connection, so two pools on one client already fight
-    over the same cache slot; separate clients do not. NodePool._nodes is a
-    class attribute, so it cannot provide this scoping.
+    Discord keys its voice-client cache by guild id per client. The coordinator
+    shares that scope even if a pool is closed and replaced for the same client.
     """
     per_guild = _coordinators.get(client)
     if per_guild is None:

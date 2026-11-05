@@ -144,6 +144,46 @@ class RestorationTests(IsolatedAsyncioTestCase):
         self.assertIs(self.guild.voice_client, adopted)
         self.assertIs(adopted._coordinator.owner, adopted)
 
+    async def test_restore_skips_fetched_guild_without_bot_member(self) -> None:
+        """REST guilds without voice state do not abort node synchronization."""
+        self.guild.me = None
+        other_guild = RestoreGuild(self.client)
+        other_guild.id = 2
+        other_channel = Mock(spec=VoiceChannel, id=20, guild=other_guild)
+        other_channel._get_voice_client_key.return_value = (2, None)
+        other_guild.me = SimpleNamespace(voice=SimpleNamespace(channel=other_channel))
+        other_payload = player_payload()
+        other_payload["guildId"] = "2"
+        self.remote.append(other_payload)
+
+        def get_guild(guild_id: int) -> RestoreGuild | None:
+            return other_guild if guild_id == 2 else None
+
+        with (
+            patch.object(
+                self.client,
+                "get_guild",
+                side_effect=get_guild,
+            ),
+            patch.object(
+                self.client,
+                "fetch_guild",
+                new=AsyncMock(return_value=self.guild),
+                create=True,
+            ) as fetch,
+            self.assertLogs("mafic.node", level="WARNING") as logs,
+        ):
+            await self.node.sync_players()
+
+        fetch.assert_awaited_once_with(GUILD_ID)
+        self.assertIsNone(self.node.get_player(GUILD_ID))
+        other = self.node.get_player(2)
+        self.assertIsNotNone(other)
+        self.assertIs(other_guild.voice_client, other)
+        self.assertIsNone(self.guild.voice_client)
+        self.assertIn("voice state", logs.output[0])
+        self.request.assert_awaited_once()
+
     async def test_restore_never_overwrites_an_unclaimed_slot(self) -> None:
         """A protocol mafic did not create must not be evicted."""
         foreign = Mock(spec=VoiceChannel)

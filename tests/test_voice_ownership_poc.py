@@ -303,6 +303,24 @@ class VoiceOwnershipTests(VoiceTestCase):
         self.assertEqual(self.guild.calls, ["join", "join"])
         self.assertIs(self.guild.voice_client, second)
 
+    async def test_foreign_replacement_during_delete_releases_old_owner(self) -> None:
+        """A foreign voice protocol survives while the stale claim is released."""
+        first = await self.bound_player()
+        self.node.block_destroy = True
+        teardown = asyncio.create_task(first.disconnect(force=True))
+        try:
+            await asyncio.wait_for(self.node.destroy_started.wait(), 2)
+            foreign = Mock(spec=VoiceProtocol)
+            self.client._connection._add_voice_client(GUILD_ID, foreign)
+            self.node.release_destroy.set()
+            await asyncio.wait_for(teardown, 2)
+
+            self.assertIs(self.guild.voice_client, foreign)
+            self.assertIsNone(first._coordinator.owner)
+        finally:
+            self.node.release_destroy.set()
+            await asyncio.gather(teardown, return_exceptions=True)
+
     async def test_replacement_while_leaving_keeps_the_join_order(self) -> None:
         """A claim during change_voice_state(None) cannot invert the two sends."""
         first = await self.bound_player()

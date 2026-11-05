@@ -17,6 +17,8 @@ Errors
             - :exc:`TrackLoadException`
             - :exc:`PlayerNotConnected`
          - :exc:`NodeAlreadyConnected`
+         - :exc:`NodePoolAlreadyBound`
+         - :exc:`NodeQuiesced`
          - :exc:`NoNodesAvailable`
          - :exc:`HTTPException`
             - :exc:`HTTPBadRequest`
@@ -42,6 +44,10 @@ Errors
 .. autoexception:: NoNodesAvailable
 
 .. autoexception:: NodeAlreadyConnected
+
+.. autoexception:: NodePoolAlreadyBound
+
+.. autoexception:: NodeQuiesced
 
 .. autoexception:: HTTPException
 

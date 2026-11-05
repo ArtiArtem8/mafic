@@ -839,6 +839,32 @@ class NodeTransferTests(IsolatedAsyncioTestCase):
         new_node.destroy.assert_awaited_once_with(guild_id=1)
         new_node.update.assert_not_awaited()
 
+    async def test_transfer_with_missing_endpoint_sends_no_target_request(self) -> None:
+        """A local voice validation error must not delete an untouched target."""
+        old_node = self.make_owner()
+        self.player._server_state = {
+            "guild_id": 1,
+            "endpoint": None,
+            "token": "token",
+        }
+        target = Node(
+            host="127.0.0.1",
+            port=2333,
+            label="target",
+            password="test-password",  # noqa: S106
+            client=self.client,
+        )
+        target._version = 4
+        with (
+            patch.object(Node, "destroy", new_callable=AsyncMock) as destroy,
+            self.assertRaises(ValueError),
+        ):
+            await self.player.transfer_to(target)
+
+        destroy.assert_not_called()
+        self.assertIs(self.player.assigned_node, old_node)
+        self.assertEqual(self.player._coordinator.remote_unknown, 0)
+
     async def test_target_restore_failure_preserves_old_owner(self) -> None:
         """A failed target state restore cannot commit partial ownership."""
         old_node = self.make_owner()
@@ -912,6 +938,69 @@ class NodeTransferTests(IsolatedAsyncioTestCase):
         self.assertFalse(self.player._voice_update_lock.locked())
         old_node.destroy.assert_awaited_once_with(guild_id=1)
         target.destroy.assert_not_awaited()
+
+    async def test_cancelled_old_cleanup_still_records_unknown_delete(self) -> None:
+        """A timeout after caller cancellation remains an unknown remote effect."""
+        old_node = self.make_owner()
+        target = self.make_node("B")
+        destroying, release = Event(), Event()
+
+        async def destroy(*, guild_id: int) -> None:
+            self.assertEqual(guild_id, 1)
+            destroying.set()
+            await release.wait()
+            raise TimeoutError
+
+        old_node.destroy.side_effect = destroy
+        transfer = asyncio.create_task(
+            self.player.transfer_to(cast("Node[Client]", target))
+        )
+        try:
+            await asyncio.wait_for(destroying.wait(), 2)
+            transfer.cancel()
+            await asyncio.sleep(0)
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(transfer, 2)
+
+            self.assertIs(self.player.assigned_node, target)
+            self.assertEqual(self.player._coordinator.remote_unknown, 1)
+        finally:
+            release.set()
+            await asyncio.gather(transfer, return_exceptions=True)
+
+    async def test_waiting_update_is_validated_against_transfer_target(self) -> None:
+        """A v4-only identifier cannot be sent after moving to a v3 node."""
+        old_node = self.make_owner()
+        target = self.make_node("B", payload=v3_player_payload(), version=3)
+        preparing, release = Event(), Event()
+
+        async def voice_update(**_kwargs: object) -> None:
+            preparing.set()
+            await release.wait()
+
+        target.voice_update.side_effect = voice_update
+        transfer = asyncio.create_task(
+            self.player.transfer_to(cast("Node[Client]", target))
+        )
+        update: asyncio.Task[None] | None = None
+        try:
+            await asyncio.wait_for(preparing.wait(), 2)
+            update = asyncio.create_task(self.player.update(track="identifier"))
+            await asyncio.sleep(0)
+            release.set()
+            await asyncio.wait_for(transfer, 2)
+            with self.assertRaisesRegex(TypeError, "does not support identifiers"):
+                await asyncio.wait_for(update, 2)
+
+            old_node.update.assert_not_awaited()
+            target.update.assert_awaited_once()
+            self.assertIs(self.player.assigned_node, target)
+        finally:
+            release.set()
+            await asyncio.gather(
+                transfer, *(() if update is None else (update,)), return_exceptions=True
+            )
 
     async def test_invalid_prerequisites_do_not_mutate_ownership(self) -> None:
         """Missing or invalid voice state leaves the old owner untouched."""

@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import asyncio
+import gc
+import weakref
 from typing import TYPE_CHECKING, cast
 from unittest import IsolatedAsyncioTestCase
 from unittest.mock import AsyncMock, Mock, patch
@@ -14,10 +16,10 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 
 from mafic.__libraries import Client, Guild, VoiceChannel
-from mafic.errors import NodeAlreadyConnected
+from mafic.errors import NodeAlreadyConnected, NodePoolAlreadyBound, NodeQuiesced
 from mafic.node import Node
 from mafic.player import Player
-from mafic.pool import NodePool
+from mafic.pool import NodePool, pool_for
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine
@@ -205,6 +207,477 @@ class NodeLifecycleTests(IsolatedAsyncioTestCase):
         self.assertEqual(self.node.session_id, "session-2")
         await self.node.sync_players()
         self.assertEqual(self.player_sessions, ["session-1", "session-2", "session-2"])
+
+    async def test_create_node_failure_closes_internal_session(self) -> None:
+        """A failed create must not strand a session owned by its hidden node."""
+        pool = NodePool(cast("Client", self.client))
+        self.addAsyncCleanup(pool.close)
+        sessions: list[aiohttp.ClientSession] = []
+
+        async def capture_session(_node: Node[Client]) -> aiohttp.ClientSession:
+            session = aiohttp.ClientSession()
+            sessions.append(session)
+            self.addAsyncCleanup(session.close)
+            return session
+
+        with (
+            patch.object(Node, "_create_session", capture_session),
+            patch.object(
+                Node, "_check_version", new=AsyncMock(side_effect=RuntimeError("bad"))
+            ),
+            self.assertRaisesRegex(RuntimeError, "bad"),
+        ):
+            await pool.create_node(
+                host=self.server.host,
+                port=cast("int", self.server.make_url("/").port),
+                label="failed",
+                password="test-password",  # noqa: S106
+            )
+
+        self.assertEqual(len(sessions), 1)
+        self.assertTrue(sessions[0].closed)
+        self.assertEqual(pool.nodes, [])
+
+    async def test_create_node_failure_preserves_external_session(self) -> None:
+        """A failed create never closes the caller's session."""
+        pool = NodePool(cast("Client", self.client))
+        self.addAsyncCleanup(pool.close)
+        async with aiohttp.ClientSession() as session:
+            with (
+                patch.object(
+                    Node,
+                    "_check_version",
+                    new=AsyncMock(side_effect=RuntimeError("bad")),
+                ),
+                self.assertRaisesRegex(RuntimeError, "bad"),
+            ):
+                await pool.create_node(
+                    host=self.server.host,
+                    port=cast("int", self.server.make_url("/").port),
+                    label="failed",
+                    password="test-password",  # noqa: S106
+                    session=session,
+                )
+
+            self.assertFalse(session.closed)
+            self.assertEqual(pool.nodes, [])
+
+    async def test_cancelled_create_node_closes_internal_session(self) -> None:
+        """Cancellation also closes the session of an unregistered node."""
+        pool = NodePool(cast("Client", self.client))
+        self.addAsyncCleanup(pool.close)
+        sessions: list[aiohttp.ClientSession] = []
+        entered = asyncio.Event()
+
+        async def capture_session(_node: Node[Client]) -> aiohttp.ClientSession:
+            session = aiohttp.ClientSession()
+            sessions.append(session)
+            self.addAsyncCleanup(session.close)
+            return session
+
+        async def check_version(_node: Node[Client]) -> int:
+            entered.set()
+            await asyncio.Event().wait()
+            return 4
+
+        with (
+            patch.object(Node, "_create_session", capture_session),
+            patch.object(Node, "_check_version", check_version),
+        ):
+            creating = asyncio.create_task(
+                pool.create_node(
+                    host=self.server.host,
+                    port=cast("int", self.server.make_url("/").port),
+                    label="cancelled",
+                    password="test-password",  # noqa: S106
+                )
+            )
+            await asyncio.wait_for(entered.wait(), 2)
+            creating.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await creating
+
+        self.assertEqual(len(sessions), 1)
+        self.assertTrue(sessions[0].closed)
+        self.assertEqual(pool.nodes, [])
+
+    async def test_pool_remains_bound_during_failed_create_cleanup(self) -> None:
+        """Pool close cannot overtake cleanup of an unregistered node."""
+        pool = NodePool(cast("Client", self.client))
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def slow_close(_node: Node[Client]) -> None:
+            entered.set()
+            await release.wait()
+
+        with (
+            patch.object(
+                Node, "connect", new=AsyncMock(side_effect=RuntimeError("bad"))
+            ),
+            patch.object(Node, "close", slow_close),
+        ):
+            creating = asyncio.create_task(
+                pool.create_node(
+                    host=self.server.host,
+                    port=cast("int", self.server.make_url("/").port),
+                    label="failed",
+                    password="test-password",  # noqa: S106
+                )
+            )
+            closing: asyncio.Task[None] | None = None
+            try:
+                await asyncio.wait_for(entered.wait(), 2)
+                closing = asyncio.create_task(pool.close())
+                await asyncio.sleep(0)
+                self.assertFalse(closing.done())
+                self.assertIs(pool_for(self.client), pool)
+                self.assertTrue(pool.closing)
+                self.assertEqual(
+                    [node.label for node in pool.managed_nodes], ["failed"]
+                )
+                release.set()
+                with self.assertRaisesRegex(RuntimeError, "bad"):
+                    await creating
+                await asyncio.wait_for(closing, 2)
+                self.assertIsNone(pool_for(self.client))
+            finally:
+                release.set()
+                await asyncio.gather(creating, return_exceptions=True)
+                if closing is not None:
+                    await asyncio.gather(closing, return_exceptions=True)
+
+        await pool.close()
+
+    async def test_pool_retries_cleanup_of_a_failed_creation(self) -> None:
+        """An unreturned node stays owned when its first cleanup fails."""
+        pool = NodePool(cast("Client", self.client))
+        attempts = 0
+
+        async def fail_once(_node: Node[Client]) -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                msg = "cleanup failed"
+                raise RuntimeError(msg)
+
+        with (
+            patch.object(
+                Node,
+                "connect",
+                new=AsyncMock(side_effect=RuntimeError("connect failed")),
+            ),
+            patch.object(Node, "close", fail_once),
+            self.assertLogs("mafic.pool", level="ERROR"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "connect failed"):
+                await pool.create_node(
+                    host=self.server.host,
+                    port=cast("int", self.server.make_url("/").port),
+                    label="failed",
+                    password="test-password",  # noqa: S106
+                )
+            self.assertIs(pool_for(self.client), pool)
+            await pool.close()
+
+        self.assertEqual(attempts, 2)
+        self.assertIsNone(pool_for(self.client))
+
+    async def test_failed_owned_session_close_keeps_node_for_retry(self) -> None:
+        """A failed HTTP session close cannot be reported as a closed pool."""
+        pool = NodePool(cast("Client", self.client))
+        await pool.add_node(self.node)
+        session: aiohttp.ClientSession = cast("Any", self.node)._Node__session
+        original_close = aiohttp.ClientSession.close
+        failed = False
+
+        async def fail_once(candidate: aiohttp.ClientSession) -> None:
+            nonlocal failed
+            if candidate is session and not failed:
+                failed = True
+                msg = "session close failed"
+                raise OSError(msg)
+            await original_close(candidate)
+
+        try:
+            with patch.object(aiohttp.ClientSession, "close", new=fail_once):
+                with self.assertRaisesRegex(OSError, "session close failed"):
+                    await pool.close()
+                self.assertFalse(session.closed)
+                self.assertIsNone(self.node._ws)
+                self.assertFalse(self.node.available)
+                self.assertIs(pool_for(self.client), pool)
+                self.assertIn(self.node, pool.failed_nodes)
+                with self.assertRaises(NodeQuiesced):
+                    await self.node.connect()
+
+                await pool.close()
+                self.assertTrue(session.closed)
+                self.assertIsNone(pool_for(self.client))
+        finally:
+            await original_close(session)
+            if pool_for(self.client) is pool:
+                await pool.close()
+
+    async def test_session_close_that_leaves_session_open_is_retryable(self) -> None:
+        """A no-op session close is not a confirmed resource release."""
+        pool = NodePool(cast("Client", self.client))
+        await pool.add_node(self.node)
+        session: aiohttp.ClientSession = cast("Any", self.node)._Node__session
+        original_close = aiohttp.ClientSession.close
+        failed = False
+
+        async def skip_once(candidate: aiohttp.ClientSession) -> None:
+            nonlocal failed
+            if candidate is session and not failed:
+                failed = True
+                return
+            await original_close(candidate)
+
+        try:
+            with patch.object(aiohttp.ClientSession, "close", new=skip_once):
+                with self.assertRaisesRegex(RuntimeError, "session did not close"):
+                    await pool.close()
+                self.assertFalse(session.closed)
+                self.assertIs(pool_for(self.client), pool)
+                self.assertIn(self.node, pool.failed_nodes)
+                await pool.close()
+                self.assertTrue(session.closed)
+        finally:
+            await original_close(session)
+            if pool_for(self.client) is pool:
+                await pool.close()
+
+    async def test_failed_websocket_close_with_external_session_is_retryable(
+        self,
+    ) -> None:
+        """The pool retains an unclosed websocket even on a caller-owned session."""
+        pool = NodePool(cast("Client", self.client))
+        session = aiohttp.ClientSession()
+        node = Node(
+            host=self.server.host,
+            port=cast("int", self.server.make_url("/").port),
+            label="external",
+            password="test-password",  # noqa: S106
+            client=cast("Client", self.client),
+            session=session,
+        )
+        await pool.add_node(node)
+        ws = node._ws
+        if ws is None:
+            self.fail("Node did not open a websocket.")
+        original_close = aiohttp.ClientWebSocketResponse.close
+        failed = False
+
+        async def fail_once(
+            candidate: aiohttp.ClientWebSocketResponse,
+            *,
+            code: int = aiohttp.WSCloseCode.OK,
+            message: bytes = b"",
+        ) -> bool:
+            nonlocal failed
+            if candidate is ws and not failed:
+                failed = True
+                msg = "websocket close failed"
+                raise OSError(msg)
+            return await original_close(candidate, code=code, message=message)
+
+        try:
+            with patch.object(aiohttp.ClientWebSocketResponse, "close", new=fail_once):
+                with self.assertRaisesRegex(OSError, "websocket close failed"):
+                    await pool.close()
+                self.assertFalse(ws.closed)
+                self.assertFalse(session.closed)
+                self.assertIs(pool_for(self.client), pool)
+                self.assertIn(node, pool.failed_nodes)
+                with self.assertRaises(NodeQuiesced):
+                    await node.connect()
+
+                await pool.close()
+                self.assertTrue(ws.closed)
+                self.assertFalse(session.closed)
+                self.assertIsNone(pool_for(self.client))
+        finally:
+            await original_close(ws)
+            await session.close()
+            if pool_for(self.client) is pool:
+                await pool.close()
+
+    async def test_pool_can_readd_same_node_after_node_close(self) -> None:
+        """A node closed directly can reconnect without leaving its pool first."""
+        pool = NodePool(cast("Client", self.client))
+        try:
+            await pool.add_node(self.node)
+            await self.node.close()
+            await pool.add_node(self.node)
+
+            self.assertIs(pool.label_to_node["test"], self.node)
+            self.assertTrue(self.node.available)
+        finally:
+            await pool.close()
+
+    async def test_connected_node_remains_owned_if_pool_reference_is_lost(self) -> None:
+        """A live websocket cannot be orphaned by dropping the pool reference."""
+        pool = NodePool(cast("Client", self.client))
+        await pool.add_node(self.node)
+        pool_ref = weakref.ref(pool)
+        del pool
+        gc.collect()
+
+        recovered = pool_for(self.client)
+        self.assertIsNotNone(recovered)
+        self.assertIs(recovered, pool_ref())
+        self.assertTrue(self.node.available)
+        with self.assertRaises(NodePoolAlreadyBound):
+            NodePool(cast("Client", self.client))
+        if recovered is not None:
+            await recovered.close()
+        self.assertFalse(self.node.available)
+        self.assertIsNone(pool_for(self.client))
+
+    async def test_pool_close_waits_for_a_hung_player_delete(self) -> None:
+        """A caller may stop waiting without abandoning an owned removal."""
+        pool = NodePool(cast("Client", self.client))
+        await pool.add_node(self.node)
+        player = self.attach_player()
+        player._take_ownership()
+        self.hold_delete = True
+        removing = asyncio.create_task(
+            pool.remove_node(self.node, transfer_players=False)
+        )
+        first: asyncio.Task[None] | None = None
+        second: asyncio.Task[None] | None = None
+        try:
+            await asyncio.wait_for(self.delete_started.wait(), 2)
+            self.assertTrue(self.sockets[0].closed)
+            first = asyncio.create_task(pool.close())
+            second = asyncio.create_task(pool.close())
+            await asyncio.sleep(0)
+            with self.assertRaises(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(first), 0.05)
+            self.assertFalse(first.done())
+            self.assertFalse(second.done())
+            self.assertIs(pool_for(self.client), pool)
+            with self.assertRaisesRegex(RuntimeError, "closing"):
+                await pool.add_node(self.node)
+
+            first.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(first.done())
+            self.release_delete.set()
+            await asyncio.wait_for(removing, 2)
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(first, 2)
+            await asyncio.wait_for(second, 2)
+            self.assertIsNone(pool_for(self.client))
+            self.assertFalse(self.node.available)
+        finally:
+            self.release_delete.set()
+            await asyncio.gather(removing, return_exceptions=True)
+            if first is not None:
+                await asyncio.gather(first, return_exceptions=True)
+            if second is not None:
+                await asyncio.gather(second, return_exceptions=True)
+            if pool_for(self.client) is pool:
+                await pool.close()
+
+    async def test_node_ready_handler_can_start_pool_close(self) -> None:
+        """An independent event handler may close while add_node completes."""
+        pool = NodePool(cast("Client", self.client))
+        closers: list[asyncio.Task[None]] = []
+        entered, release = asyncio.Event(), asyncio.Event()
+        original_connect = self.node.connect
+
+        def dispatch(event: str, _node: Node[Client]) -> None:
+            if event == "node_ready":
+                closers.append(asyncio.create_task(pool.close()))
+
+        async def gated_connect(
+            _node: Node[Client], *, player_cls: type[Player[Client]] | None = None
+        ) -> None:
+            await original_connect(player_cls=player_cls)
+            entered.set()
+            await release.wait()
+
+        self.client.dispatch.side_effect = dispatch
+        with patch.object(Node, "connect", new=gated_connect):
+            adding = asyncio.create_task(pool.add_node(self.node))
+            try:
+                await asyncio.wait_for(entered.wait(), 2)
+                self.assertEqual(len(closers), 1)
+                self.assertFalse(adding.done())
+                self.assertFalse(closers[0].done())
+                self.assertIs(pool_for(self.client), pool)
+                release.set()
+                await asyncio.wait_for(asyncio.shield(adding), 2)
+                await asyncio.wait_for(asyncio.shield(closers[0]), 2)
+                self.assertFalse(self.node.available)
+                self.assertIsNone(pool_for(self.client))
+            finally:
+                release.set()
+                if any(not closer.done() for closer in closers) and pool._close_task:
+                    pool._close_task.cancel()
+                await asyncio.gather(adding, *closers, return_exceptions=True)
+                if pool_for(self.client) is pool:
+                    await pool.close()
+
+    async def test_recovered_pool_exposes_node_to_unblock_hung_removal(self) -> None:
+        """An operator can find and close a node whose DELETE is stuck."""
+        pool = NodePool(cast("Client", self.client))
+        await pool.add_node(self.node)
+        player = self.attach_player()
+        player._take_ownership()
+        self.hold_delete = True
+        removing = asyncio.create_task(
+            pool.remove_node(self.node, transfer_players=False)
+        )
+        closing: asyncio.Task[None] | None = None
+        aborting: asyncio.Task[None] | None = None
+        try:
+            await asyncio.wait_for(self.delete_started.wait(), 2)
+            closing = asyncio.create_task(pool.close())
+            await asyncio.sleep(0)
+            del pool
+            recovered = pool_for(self.client)
+            self.assertIsNotNone(recovered)
+            if recovered is None:
+                self.fail("The closing pool could not be recovered.")
+            self.assertTrue(recovered.closing)
+            self.assertIn(self.node, recovered.managed_nodes)
+            self.assertEqual(recovered.label_to_node, {})
+
+            aborting = asyncio.create_task(self.node.close())
+            await asyncio.wait_for(asyncio.shield(aborting), 2)
+            await asyncio.wait_for(asyncio.shield(removing), 2)
+            await asyncio.wait_for(asyncio.shield(closing), 2)
+            self.assertGreaterEqual(player._coordinator.remote_unknown, 1)
+            self.assertIsNone(pool_for(self.client))
+        finally:
+            self.release_delete.set()
+            await asyncio.gather(removing, return_exceptions=True)
+            if aborting is not None:
+                await asyncio.gather(aborting, return_exceptions=True)
+            if closing is not None:
+                await asyncio.gather(closing, return_exceptions=True)
+            remaining = pool_for(self.client)
+            if remaining is not None:
+                await remaining.close()
+
+    async def test_pool_can_rebind_same_node_after_pool_close(self) -> None:
+        """A closed pool can reclaim its client and reconnect a real node."""
+        pool = NodePool(cast("Client", self.client))
+        try:
+            await pool.add_node(self.node)
+            await pool.close()
+            self.assertIsNone(pool_for(self.client))
+            self.assertEqual(pool.label_to_node, {})
+
+            await pool.add_node(self.node)
+
+            self.assertIs(pool_for(self.client), pool)
+            self.assertIs(pool.label_to_node["test"], self.node)
+            self.assertTrue(self.node.available)
+        finally:
+            await pool.close()
 
     async def test_initial_failure_does_not_register_unready_node(self) -> None:
         """NodePool waits through failures and retains the requested player class."""
@@ -575,6 +1048,36 @@ class NodeLifecycleTests(IsolatedAsyncioTestCase):
                 await self.node.close()
                 self.assertTrue(listener.done())
 
+    async def test_transport_close_failure_stops_reconnect_until_retry(self) -> None:
+        """A failed socket cleanup must not lose the old transport on reconnect."""
+        ws = Mock(spec=aiohttp.ClientWebSocketResponse, closed=False)
+        ws.receive = AsyncMock(return_value=Mock(type=aiohttp.WSMsgType.CLOSING))
+        failed = False
+
+        async def fail_once() -> None:
+            nonlocal failed
+            if not failed:
+                failed = True
+                msg = "websocket close failed"
+                raise OSError(msg)
+            ws.closed = True
+
+        ws.close = AsyncMock(side_effect=fail_once)
+        self.node._ws = cast("aiohttp.ClientWebSocketResponse", ws)
+        self.node._available = True
+        with self.assertLogs("mafic.node", level="ERROR"):
+            listener = asyncio.create_task(self.node._ws_listener())
+            self.node._ws_task = listener
+            await self.next_event("node_unavailable")
+            with self.assertRaisesRegex(OSError, "websocket close failed"):
+                await listener
+        self.assertIs(self.node._ws, ws)
+        self.assertFalse(self.node.available)
+
+        await self.node.close()
+        self.assertTrue(ws.closed)
+        self.assertIsNone(self.node._ws)
+
     def assert_no_lifecycle_tasks(self, node: Node[Client]) -> None:
         """Assert that a closed node left no background lifecycle owner."""
         self.assertIsNone(node._connect_task)
@@ -767,7 +1270,9 @@ class NodeLifecycleTests(IsolatedAsyncioTestCase):
             label="timeout",
             password="test-password",  # noqa: S106
             client=cast("Client", self.client),
-            timeout=1,
+            # Give the websocket setup room under load; the HTTP timeout
+            # tested below is independent of this deadline.
+            timeout=5,
             http_timeout=aiohttp.ClientTimeout(total=0.2),
         )
         self.addAsyncCleanup(node.close)

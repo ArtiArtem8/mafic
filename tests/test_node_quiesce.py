@@ -79,6 +79,33 @@ class NodeQuiesceTests(IsolatedAsyncioTestCase):
         self.assertIsNone(node._ws)
         self.assertFalse(node.available)
 
+    async def test_quiesce_failure_retains_websocket_for_close_retry(self) -> None:
+        """A failed planned stop must not lose track of the open transport."""
+        node = self._make_node()
+        ws = _FakeWebSocket()
+        failed = False
+
+        async def fail_once() -> None:
+            nonlocal failed
+            if not failed:
+                failed = True
+                msg = "websocket close failed"
+                raise OSError(msg)
+            ws.closed = True
+
+        cast("Any", ws).close = AsyncMock(side_effect=fail_once)
+        node._ws = cast("ClientWebSocketResponse", ws)
+        with self.assertRaisesRegex(OSError, "websocket close failed"):
+            await node.quiesce()
+        self.assertIs(node._ws, ws)
+        self.assertFalse(ws.closed)
+        with self.assertRaises(NodeQuiesced):
+            await node.connect()
+
+        await node.close()
+        self.assertTrue(ws.closed)
+        self.assertIsNone(node._ws)
+
     async def test_quiesce_publishes_no_loss_and_starts_no_reconnect(self) -> None:
         """A planned shutdown must not look like an accidental websocket loss."""
         node = self._make_node()

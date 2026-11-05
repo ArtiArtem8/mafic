@@ -30,6 +30,10 @@ __all__ = (
 )
 
 
+class RequestNotSent(RuntimeError):
+    """Mark an internal request rejected locally before any HTTP I/O."""
+
+
 class MaficException(Exception):
     """The base exception class for custom exceptions raised by Mafic."""
 

@@ -5,6 +5,34 @@ Changes in `maintained/lavalink-v4` since upstream
 Dates follow Git history. Related code, test and documentation commits are grouped
 into one entry, with links to the original changes.
 
+## November 6, 2026
+
+- `NodePool.remove_node()` rejects nodes belonging to another client
+- `NodePool.close()` waits for all nodes even after caller cancellation; if a
+  node fails to close, the client stays bound so closing can be retried
+- The client retains its pool until successful close, even if the application
+  loses its reference; `pool_for(client)` recovers it. `closing`,
+  `managed_nodes` and `failed_nodes` expose shutdown state for recovery
+- A closed pool clears its node mapping and can be reused while its client is
+  free; an older pool cannot operate after a new pool claims that client
+- Conflicting node labels are rejected before connecting; the same node can be
+  re-added after its own close. Pool close waits for in-flight node creation,
+  addition and removal, and rejects new node operations until it finishes
+- **Breaking:** `label_to_node` is a read-only live view; change the pool with
+  `add_node()` and `remove_node()` instead of mutating the mapping
+- Failed or cancelled `create_node()` closes its internally owned session and
+  leaves a caller-supplied session open
+- Failed HTTP-session or WebSocket shutdown is reported and retained for retry;
+  the node remains quiesced until its owned resources close successfully
+- Empty-pool selection consistently raises `NoNodesAvailable`
+- Queued player updates follow a committed transfer and validate against the
+  target node's Lavalink version
+- Release a stale voice owner after a foreign protocol replaces it; preserve
+  unknown DELETE outcomes after transfer cancellation without marking locally
+  rejected requests as unknown
+- Skip restoration with a warning when a fetched guild has no bot voice state
+- Use one timeout for the Discord join request and readiness wait
+
 ## November 3, 2026
 
 - Added `Node.quiesce()` for a planned stop of the node transport that keeps
@@ -13,8 +41,9 @@ into one entry, with links to the original changes.
 - `NodePool.remove_node()` now quiesces the node before snapshotting players,
   so removal owns the whole teardown and no reconnect can register a player
   into a node that is already leaving the pool
-- `NodePool.nodes` and `NodePool.get_node()` are instance members: node state,
-  strategies and the client binding no longer leak between pools
+- `NodePool.nodes`, `NodePool.label_to_node`, `NodePool.get_node()` and
+  `NodePool.get_random_node()` are instance members: node state, strategies
+  and the client binding no longer leak between pools
   - **Breaking:** class-level access such as `NodePool.nodes` no longer works;
     keep a pool instance and use it instead
   - Each Discord client has one active pool; `NodePoolAlreadyBound` is raised

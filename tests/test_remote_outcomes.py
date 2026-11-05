@@ -6,14 +6,17 @@ from __future__ import annotations
 
 import asyncio
 from typing import TYPE_CHECKING, cast
+from unittest.mock import AsyncMock, patch
+
+import aiohttp
 
 from mafic.errors import HTTPBadRequest, HTTPNotFound
+from mafic.node import Node
 
 from .test_voice_ownership_poc import GUILD_ID, VoiceTestCase
 
 if TYPE_CHECKING:
     from mafic.__libraries import Client
-    from mafic.node import Node
     from mafic.player import Player
 
 
@@ -64,7 +67,7 @@ class RemoteOutcomeTests(VoiceTestCase):
         self.assertEqual(player._coordinator.remote_unknown, 1)
 
     async def test_cancelled_patch_is_recorded_and_propagates(self) -> None:
-        """Cancelling the await does not cancel a request already sent."""
+        """Cancelling the await cannot undo a request already sent."""
         player = await self.connected()
         self.node.update_error = asyncio.CancelledError()
 
@@ -82,6 +85,70 @@ class RemoteOutcomeTests(VoiceTestCase):
             await player._dispatch_player_update()
 
         self.assertEqual(player._coordinator.remote_unknown, 1)
+
+    async def test_missing_voice_endpoint_never_marks_a_request_unknown(self) -> None:
+        """A rejected local payload cannot have affected Lavalink."""
+        player = await self.connected()
+        node: Node[Client] = Node(
+            host="127.0.0.1",
+            port=2333,
+            label="local",
+            password="test",  # noqa: S106
+            client=cast("Client", self.client),
+        )
+        player._node = node
+        player._server_state = {
+            "guild_id": GUILD_ID,
+            "endpoint": None,
+            "token": "token",
+        }
+        request = AsyncMock()
+        with (
+            patch.object(Node, "_Node__request", request),
+            self.assertRaises(ValueError),
+        ):
+            await player._dispatch_player_update()
+
+        request.assert_not_called()
+        self.assertEqual(player._coordinator.remote_unknown, 0)
+
+    async def test_closing_node_does_not_mark_an_unsent_request_unknown(self) -> None:
+        """A local shutdown guard runs before the HTTP request can start."""
+        player = await self.connected()
+        node: Node[Client] = Node(
+            host="127.0.0.1",
+            port=2333,
+            label="closing",
+            password="test",  # noqa: S106
+            client=cast("Client", self.client),
+        )
+        node._closing = True
+        player._node = node
+        try:
+            with self.assertRaisesRegex(RuntimeError, "Node is closing"):
+                await player.update(volume=10)
+            self.assertEqual(player._coordinator.remote_unknown, 0)
+        finally:
+            node._closing = False
+            await node.close()
+
+    async def test_closed_session_does_not_mark_an_unsent_request_unknown(self) -> None:
+        """A closed HTTP session cannot have sent the requested update."""
+        player = await self.connected()
+        session = aiohttp.ClientSession()
+        await session.close()
+        node: Node[Client] = Node(
+            host="127.0.0.1",
+            port=2333,
+            label="closed-session",
+            password="test",  # noqa: S106
+            client=cast("Client", self.client),
+            session=session,
+        )
+        player._node = node
+        with self.assertRaisesRegex(RuntimeError, "HTTP session is closed"):
+            await player.update(volume=10)
+        self.assertEqual(player._coordinator.remote_unknown, 0)
 
     async def test_rejected_patch_is_not_recorded_as_unknown(self) -> None:
         """A 400 proves the server refused the PATCH."""
